@@ -3,14 +3,16 @@ from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs, quote
 from pathlib import Path
 from io import BytesIO
-import sqlite3, json, threading, datetime, socket, os, sys, traceback, re
+import sqlite3, json, threading, datetime, socket, os, sys, traceback, re, secrets, hashlib, hmac, time, http.cookies
 from openpyxl import Workbook, load_workbook
 from openpyxl.styles import Font, PatternFill, Alignment
 from openpyxl.utils import get_column_letter
 import qrcode
 
 BASE=Path(__file__).resolve().parent
-DB=BASE/'inventory.db'
+DATA=Path(os.environ.get('DATA_DIR',str(BASE))).resolve()
+DATA.mkdir(parents=True,exist_ok=True)
+DB=DATA/'inventory.db'
 LOCK=threading.RLock()
 
 def connect():
@@ -26,7 +28,85 @@ def setup():
         CREATE TABLE IF NOT EXISTS racks (rack TEXT PRIMARY KEY, capacity INTEGER NOT NULL DEFAULT 20);
         CREATE TABLE IF NOT EXISTS stock (rack TEXT NOT NULL, model TEXT NOT NULL COLLATE NOCASE, qty INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (rack, model), FOREIGN KEY(rack) REFERENCES racks(rack));
         CREATE TABLE IF NOT EXISTS movements (id INTEGER PRIMARY KEY AUTOINCREMENT, at TEXT NOT NULL, employee TEXT NOT NULL, action TEXT NOT NULL, rack TEXT NOT NULL, model TEXT NOT NULL, qty INTEGER NOT NULL, before_qty INTEGER, after_qty INTEGER, note TEXT DEFAULT '');
+        CREATE TABLE IF NOT EXISTS users (username TEXT PRIMARY KEY COLLATE NOCASE, pass_hash TEXT NOT NULL, salt TEXT NOT NULL, active INTEGER NOT NULL DEFAULT 1);
+        CREATE TABLE IF NOT EXISTS sessions (token_hash TEXT PRIMARY KEY, username TEXT NOT NULL, role TEXT NOT NULL, until INTEGER NOT NULL);
         ''')
+
+# Admin password is set as an environment variable, not stored in files/repository.
+ADMIN_PASSWORD=os.environ.get('ADMIN_PASSWORD','')
+if not ADMIN_PASSWORD:
+    raise RuntimeError('Set ADMIN_PASSWORD before starting. Use a unique strong password.')
+
+# Server-side sessions. A cookie is never trusted without looking up its hash.
+def hash_password(password, salt):
+    return hashlib.pbkdf2_hmac('sha256',password.encode(),bytes.fromhex(salt),260_000).hex()
+
+def user_for(h):
+    cookie=http.cookies.SimpleCookie()
+    try: cookie.load(h.headers.get('Cookie',''))
+    except: return None
+    token=cookie.get('rackflow_session')
+    if not token:return None
+    hashed=hashlib.sha256(token.value.encode()).hexdigest()
+    with connect() as db:
+        row=db.execute('SELECT username,role FROM sessions WHERE token_hash=? AND until>?',(hashed,int(time.time()))).fetchone()
+        if row and row['role']=='employee':
+            active=db.execute('SELECT active FROM users WHERE username=?',(row['username'],)).fetchone()
+            if not active or not active['active']:return None
+    return dict(row) if row else None
+
+def login_user(h,data):
+    username=cleanstr(data.get('username')).lower()
+    password=str(data.get('password') or '')
+    if len(username)>50 or len(password)>256 or not username or not password:raise ValueError('Invalid login')
+    if username=='admin':
+        valid=hmac.compare_digest(password,ADMIN_PASSWORD)
+        role='admin'
+    else:
+        role='employee'
+        with connect() as db: u=db.execute('SELECT salt,pass_hash,active FROM users WHERE username=?',(username,)).fetchone()
+        valid=bool(u and u['active'] and hmac.compare_digest(hash_password(password,u['salt']),u['pass_hash']))
+    if not valid:
+        time.sleep(0.3)
+        raise ValueError('Incorrect username or password')
+    token=secrets.token_urlsafe(40)
+    with connect() as db:
+        db.execute('DELETE FROM sessions WHERE until<?',(int(time.time()),))
+        db.execute('INSERT INTO sessions(token_hash,username,role,until) VALUES(?,?,?,?)',(hashlib.sha256(token.encode()).hexdigest(),username,role,int(time.time())+60*60*24*14))
+        db.commit()
+    payload=json.dumps({'ok':True,'username':username,'role':role}).encode()
+    h.send_response(200)
+    h.send_header('Content-Type','application/json')
+    h.send_header('Cache-Control','no-store')
+    h.send_header('Set-Cookie',f'rackflow_session={token}; Path=/; HttpOnly; Secure; SameSite=Strict; Max-Age=1209600')
+    h.send_header('Content-Length',str(len(payload)))
+    h.end_headers();h.wfile.write(payload)
+
+def admin_users():
+    with connect() as db:
+        return [dict(row) for row in db.execute('SELECT username,active FROM users ORDER BY username')]
+
+def create_user(data):
+    name=cleanstr(data.get('username')).lower()
+    password=str(data.get('password') or '')
+    if not re.fullmatch(r'[a-z0-9][a-z0-9._-]{1,31}',name) or name=='admin':raise ValueError('Employee username must be 2–32 letters, numbers, dot, underscore or dash.')
+    if len(password)<8 or len(password)>128:raise ValueError('Employee password must have 8–128 characters')
+    salt=secrets.token_hex(16)
+    with connect() as db:
+        db.execute('INSERT INTO users(username,pass_hash,salt,active) VALUES(?,?,?,1) ON CONFLICT(username) DO UPDATE SET pass_hash=excluded.pass_hash,salt=excluded.salt,active=1',(name,hash_password(password,salt),salt))
+        db.commit()
+    return {'ok':True,'username':name}
+
+def set_user_active(data):
+    name=cleanstr(data.get('username')).lower()
+    if name=='admin':raise ValueError('Cannot change admin here')
+    active=1 if data.get('active') else 0
+    with connect() as db:
+        r=db.execute('UPDATE users SET active=? WHERE username=?',(active,name))
+        if not r.rowcount:raise ValueError('Employee not found')
+        if not active:db.execute('DELETE FROM sessions WHERE username=?',(name,))
+        db.commit()
+    return {'ok':True}
 
 def stamp(): return datetime.datetime.now().astimezone().isoformat(timespec='seconds')
 def respond_json(h,data,status=200):
@@ -155,20 +235,31 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self,fmt,*args): print('%s %s'%(self.address_string(),fmt%args))
     def do_GET(self):
         path=urlparse(self.path).path
+        identity=user_for(self)
         if path=='/':
             raw=(BASE/'static'/'index.html').read_bytes();self.binary(raw,'text/html; charset=utf-8');return
+        if path=='/api/me':respond_json(self,identity or {'role':'guest'});return
+        if path=='/health':respond_json(self,{'ok':True});return
+        if not identity:return error(self,'Please log in',401)
         if path=='/jsQR.js':
             p=BASE/'static'/'jsQR.js'
             if p.exists(): self.binary(p.read_bytes(),'application/javascript');return
             error(self,'Scanner library not installed',404);return
-        if path=='/api/state':respond_json(self,make_state());return
+        if path=='/api/state':
+            s=make_state()
+            if identity['role']!='admin':s.pop('movements',None)
+            respond_json(self,s);return
+        if path=='/api/users':
+            if identity['role']!='admin':return error(self,'Admin only',403)
+            respond_json(self,admin_users());return
         if path in ('/api/export','/api/template'):
+            if identity['role']!='admin':return error(self,'Admin only',403)
             self.binary(make_excel(path.endswith('template')),'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',attachment='rack_stock_template.xlsx' if path.endswith('template') else 'rack_stock_current.xlsx');return
         if path.startswith('/api/qr/'):
+            if identity['role']!='admin':return error(self,'Admin only',403)
             rack=path[len('/api/qr/'):].strip().upper()
             if not rack or len(rack)>80:return error(self,'Invalid rack')
             img=qrcode.make(rack);buf=BytesIO();img.save(buf,format='PNG');self.binary(buf.getvalue(),'image/png');return
-        if path=='/health':respond_json(self,{'ok':True});return
         error(self,'Not found',404)
     def binary(self,payload,ctype,attachment=None):
         self.send_response(200);self.send_header('Content-Type',ctype);self.send_header('Content-Length',str(len(payload)))
@@ -177,14 +268,47 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         path=urlparse(self.path).path
         try:
+            origin=self.headers.get('Origin')
+            if origin:
+                from urllib.parse import urlsplit
+                target=urlsplit(origin)
+                host=self.headers.get('X-Forwarded-Host',self.headers.get('Host','')).split(',')[0].strip()
+                if target.netloc.lower()!=host.lower():return error(self,'Invalid request origin',403)
             size=int(self.headers.get('Content-Length','0'))
             if size<=0 or size>12*1024*1024:raise ValueError('Request is empty or too large')
             raw=self.rfile.read(size)
-            if path=='/api/import':respond_json(self,import_excel(raw));return
+            identity=user_for(self)
+            if path=='/api/login':
+                try:data=json.loads(raw)
+                except:raise ValueError('Invalid request')
+                login_user(self,data);return
+            if not identity:return error(self,'Please log in',401)
+            if path=='/api/logout':
+                cookie=http.cookies.SimpleCookie()
+                try:cookie.load(self.headers.get('Cookie',''))
+                except:pass
+                token=cookie.get('rackflow_session')
+                if token:
+                    with connect() as db:db.execute('DELETE FROM sessions WHERE token_hash=?',(hashlib.sha256(token.value.encode()).hexdigest(),));db.commit()
+                payload=b'{"ok":true}'
+                self.send_response(200);self.send_header('Set-Cookie','rackflow_session=; Path=/; Max-Age=0; HttpOnly; Secure; SameSite=Strict');self.send_header('Content-Type','application/json');self.send_header('Content-Length',str(len(payload)));self.end_headers();self.wfile.write(payload);return
+            if path=='/api/import':
+                if identity['role']!='admin':return error(self,'Admin only',403)
+                respond_json(self,import_excel(raw));return
             try:data=json.loads(raw)
             except:raise ValueError('Invalid request')
-            if path=='/api/out':respond_json(self,mutate(data,-1));return
-            if path=='/api/in':respond_json(self,mutate(data,1));return
+            if path=='/api/users':
+                if identity['role']!='admin':return error(self,'Admin only',403)
+                respond_json(self,create_user(data));return
+            if path=='/api/user-status':
+                if identity['role']!='admin':return error(self,'Admin only',403)
+                respond_json(self,set_user_active(data));return
+            if path=='/api/out':
+                data['employee']=identity['username']
+                respond_json(self,mutate(data,-1));return
+            if path=='/api/in':
+                data['employee']=identity['username']
+                respond_json(self,mutate(data,1));return
             error(self,'Not found',404)
         except ValueError as ex:error(self,str(ex))
         except Exception as ex:traceback.print_exc();error(self,'Server error. Please retry.',500)
