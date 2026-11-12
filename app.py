@@ -3,34 +3,138 @@ from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs, quote
 from pathlib import Path
 from io import BytesIO
-import sqlite3, json, threading, datetime, socket, os, sys, traceback, re, secrets, hashlib, hmac, time, http.cookies
+import sqlite3, json, threading, datetime, socket, os, sys, traceback, re, secrets, hashlib, hmac, time, http.cookies, uuid, shutil, tempfile
 from openpyxl import Workbook, load_workbook
 from openpyxl.styles import Font, PatternFill, Alignment
 from openpyxl.utils import get_column_letter
 import qrcode
 
 BASE=Path(__file__).resolve().parent
+IS_RAILWAY=any(os.getenv(k) for k in ('RAILWAY_ENVIRONMENT','RAILWAY_ENVIRONMENT_ID','RAILWAY_PROJECT_ID','RAILWAY_DEPLOYMENT_ID'))
+# IMPORTANT: Never fall back to /app on Railway; its filesystem is disposable.
+if IS_RAILWAY:
+    if os.getenv('DATA_DIR') != '/data':
+        raise RuntimeError('STORAGE SAFETY STOP: Railway DATA_DIR must be /data. No database was changed.')
+    if os.getenv('RAILWAY_VOLUME_MOUNT_PATH') != '/data':
+        raise RuntimeError('STORAGE SAFETY STOP: no Railway volume mounted at /data. Attach original volume; do not create a new one.')
 DATA=Path(os.environ.get('DATA_DIR',str(BASE))).resolve()
-DATA.mkdir(parents=True,exist_ok=True)
+if not IS_RAILWAY:
+    DATA.mkdir(parents=True,exist_ok=True)
+if not DATA.is_dir():
+    raise RuntimeError(f'STORAGE SAFETY STOP: persistent data folder {DATA} does not exist.')
 DB=DATA/'inventory.db'
+BACKUPS=DATA/'backups'
+GUARD=DATA/'.rackflow_volume_identity'
 LOCK=threading.RLock()
+GUARD_ACTIVE=False
+EXPECTED_ID=None
+REQUIRED_TABLES={'racks','stock','movements','users','sessions'}
+
+def verify_existing_db():
+    # Read-only verification: sqlite3.connect(DB) without mode=ro would CREATE an empty DB.
+    if not DB.is_file() or DB.stat().st_size < 4096:
+        raise RuntimeError(f'STORAGE SAFETY STOP: {DB} is missing/empty. The app will NOT create a new database. Attach the original volume or restore a backup.')
+    with sqlite3.connect(f'file:{DB}?mode=ro',uri=True) as c:
+        tables={r[0] for r in c.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        if not REQUIRED_TABLES.issubset(tables):
+            raise RuntimeError(f'STORAGE SAFETY STOP: {DB} has missing inventory tables: {sorted(REQUIRED_TABLES-tables)}')
+        result=c.execute('PRAGMA quick_check').fetchone()[0]
+        if result!='ok':
+            raise RuntimeError(f'STORAGE SAFETY STOP: database integrity issue: {result}')
+
+def verify_mount():
+    if not IS_RAILWAY:return
+    # Railway injects mount information only at runtime, not at build time.
+    try:
+        mounts=Path('/proc/self/mountinfo').read_text().splitlines()
+        mounted=any(line.split(' - ',1)[0].split()[4]=='/data' for line in mounts if ' - ' in line)
+    except OSError as e:
+        raise RuntimeError('STORAGE SAFETY STOP: unable to verify Railway volume mount') from e
+    if not mounted:
+        raise RuntimeError('STORAGE SAFETY STOP: /data is not an actual mounted volume. No database was changed.')
 
 def connect():
-    c=sqlite3.connect(DB, timeout=30)
+    if GUARD_ACTIVE:
+        if not DB.is_file() or not GUARD.is_file() or GUARD.read_text().strip()!=EXPECTED_ID:
+            raise RuntimeError('STORAGE SAFETY STOP: database/volume identity changed. Refusing to write.')
+    c=sqlite3.connect(DB,timeout=30)
     c.row_factory=sqlite3.Row
     c.execute('PRAGMA journal_mode=WAL')
     c.execute('PRAGMA busy_timeout=30000')
     return c
 
+def backup_db(category='latest'):
+    """Consistent SQLite backup that includes uncheckpointed WAL changes. Stored on /data."""
+    BACKUPS.mkdir(parents=True,exist_ok=True)
+    fd, tmp=tempfile.mkstemp(prefix='.rackflow_tmp_',suffix='.db',dir=BACKUPS)
+    os.close(fd)
+    try:
+        src=sqlite3.connect(f'file:{DB}?mode=ro',uri=True)
+        dst=sqlite3.connect(tmp)
+        try:src.backup(dst)
+        finally:dst.close();src.close()
+        with sqlite3.connect(f'file:{tmp}?mode=ro',uri=True) as chk:
+            if chk.execute('PRAGMA quick_check').fetchone()[0]!='ok':
+                raise RuntimeError('SQLite backup verification failed')
+        now=datetime.datetime.now(datetime.timezone.utc)
+        if category=='pre-import':
+            name=f'pre-import_{now.strftime("%Y%m%d_%H%M%S_%f")}.db'
+        elif category=='manual':
+            name=f'manual_{now.strftime("%Y%m%d_%H%M%S_%f")}.db'
+        elif category=='pre-upgrade':
+            name=f'pre-upgrade_{now.strftime("%Y%m%d_%H%M%S_%f")}.db'
+        else:
+            name='latest.db'
+        out=BACKUPS/name
+        os.replace(tmp,out)
+        # Rotating point-in-time recovery copies, distinct from latest.
+        if category=='latest':
+            hour=BACKUPS/f'hourly_{now.strftime("%Y%m%d_%H")}.db'
+            day=BACKUPS/f'daily_{now.strftime("%Y%m%d")}.db'
+            if not hour.exists():shutil.copyfile(out,hour)
+            if not day.exists():shutil.copyfile(out,day)
+        for prefix,retain in [('hourly_',24),('daily_',14),('pre-import_',15),('manual_',10),('pre-upgrade_',5)]:
+            old=sorted(BACKUPS.glob(prefix+'*.db'))
+            for stale in old[:-retain]:stale.unlink()
+        return out
+    finally:
+        if os.path.exists(tmp):os.unlink(tmp)
+
+def backup_after_change():
+    try:backup_db('latest')
+    except Exception as e:
+        print('WARNING: Stock/account saved, but automatic backup failed:',repr(e),flush=True)
+
 def setup():
-    with connect() as db:
-        db.executescript('''
-        CREATE TABLE IF NOT EXISTS racks (rack TEXT PRIMARY KEY, capacity INTEGER NOT NULL DEFAULT 20);
-        CREATE TABLE IF NOT EXISTS stock (rack TEXT NOT NULL, model TEXT NOT NULL COLLATE NOCASE, qty INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (rack, model), FOREIGN KEY(rack) REFERENCES racks(rack));
-        CREATE TABLE IF NOT EXISTS movements (id INTEGER PRIMARY KEY AUTOINCREMENT, at TEXT NOT NULL, employee TEXT NOT NULL, action TEXT NOT NULL, rack TEXT NOT NULL, model TEXT NOT NULL, qty INTEGER NOT NULL, before_qty INTEGER, after_qty INTEGER, note TEXT DEFAULT '');
-        CREATE TABLE IF NOT EXISTS users (username TEXT PRIMARY KEY COLLATE NOCASE, pass_hash TEXT NOT NULL, salt TEXT NOT NULL, active INTEGER NOT NULL DEFAULT 1);
-        CREATE TABLE IF NOT EXISTS sessions (token_hash TEXT PRIMARY KEY, username TEXT NOT NULL, role TEXT NOT NULL, until INTEGER NOT NULL);
-        ''')
+    verify_mount()
+    verify_existing_db() # stop instead of initializing a fresh/incorrect database
+    global GUARD_ACTIVE,EXPECTED_ID
+    # Look for the volume's identity without modifying its database.
+    with sqlite3.connect(f'file:{DB}?mode=ro',uri=True) as ro:
+        exists=ro.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='rackflow_meta'").fetchone()
+        row=ro.execute('SELECT value FROM rackflow_meta WHERE key=?',('volume_id',)).fetchone() if exists else None
+        db_id=row[0] if row else None
+    marker_id=GUARD.read_text().strip() if GUARD.is_file() else None
+    pinned=os.getenv("RACKFLOW_EXPECTED_VOLUME_ID","").strip()
+    if pinned and (not db_id or not marker_id):
+        raise RuntimeError("STORAGE SAFETY STOP: pinned volume identity not found. Attach original Railway volume.")
+    if not db_id and not marker_id:
+        # One-time migration of an EXISTING valid DB; never create a new DB.
+        backup_db('pre-upgrade')
+        db_id=secrets.token_hex(24)
+        with sqlite3.connect(DB) as c:
+            c.execute('CREATE TABLE IF NOT EXISTS rackflow_meta (key TEXT PRIMARY KEY,value TEXT NOT NULL)')
+            c.execute('INSERT INTO rackflow_meta(key,value) VALUES(?,?)',('volume_id',db_id))
+            c.commit()
+        GUARD.write_text(db_id)
+    elif not db_id or not marker_id or db_id!=marker_id:
+        raise RuntimeError('STORAGE SAFETY STOP: volume identity missing/mismatch. Do not recreate users or stock.')
+    if pinned and pinned!=db_id:
+        raise RuntimeError("STORAGE SAFETY STOP: different Railway volume detected. Attach original volume; no inventory modified.")
+    EXPECTED_ID=db_id
+    GUARD_ACTIVE=True
+    backup_db('latest')
+    print('RackFlow persistent SQLite verified:',DB,'volume identity',EXPECTED_ID[:8],flush=True)
 
 # Admin password is set as an environment variable, not stored in files/repository.
 ADMIN_PASSWORD=os.environ.get('ADMIN_PASSWORD','')
@@ -95,6 +199,7 @@ def create_user(data):
     with connect() as db:
         db.execute('INSERT INTO users(username,pass_hash,salt,active) VALUES(?,?,?,1) ON CONFLICT(username) DO UPDATE SET pass_hash=excluded.pass_hash,salt=excluded.salt,active=1',(name,hash_password(password,salt),salt))
         db.commit()
+    backup_after_change()
     return {'ok':True,'username':name}
 
 def set_user_active(data):
@@ -106,6 +211,7 @@ def set_user_active(data):
         if not r.rowcount:raise ValueError('Employee not found')
         if not active:db.execute('DELETE FROM sessions WHERE username=?',(name,))
         db.commit()
+    backup_after_change()
     return {'ok':True}
 
 def stamp(): return datetime.datetime.now().astimezone().isoformat(timespec='seconds')
@@ -157,6 +263,7 @@ def mutate(data, direction):
         db.execute('INSERT INTO stock(rack,model,qty) VALUES(?,?,?) ON CONFLICT(rack,model) DO UPDATE SET qty=excluded.qty',(rack,model,after))
         db.execute('INSERT INTO movements (at,employee,action,rack,model,qty,before_qty,after_qty,note) VALUES (?,?,?,?,?,?,?,?,?)',(stamp(),employee,'IN' if direction==1 else 'OUT',rack,model,qty,before,after,note))
         db.commit()
+        backup_after_change()
         return {'ok':True,'rack':rack,'model':model,'before':before,'after':after}
 
 def make_excel(template=False):
@@ -224,11 +331,14 @@ def import_excel(raw):
     if issues:raise ValueError('Excel validation failed: '+'; '.join(issues[:12]))
     if not racks:raise ValueError('No racks found in Excel')
     with LOCK,connect() as db:
+        # Take a dated, restorable snapshot BEFORE any destructive Excel replacement.
+        backup_db('pre-import')
         db.execute('BEGIN IMMEDIATE');db.execute('DELETE FROM stock');db.execute('DELETE FROM racks')
         db.executemany('INSERT INTO racks(rack,capacity) VALUES(?,?)',racks.items())
         db.executemany('INSERT INTO stock(rack,model,qty) VALUES(?,?,?)',[(r['rack'],r['model'],r['qty']) for r in records.values()])
         db.execute('INSERT INTO movements(at,employee,action,rack,model,qty,before_qty,after_qty,note) VALUES(?,?,?,?,?,?,?,?,?)',(stamp(),'Admin','EXCEL IMPORT','ALL','Master stock replaced',sum(usage.values()),None,None,f'{len(racks)} racks; {len(records)} model-rack records'))
         db.commit()
+        backup_after_change()
     return {'ok':True,'racks':len(racks),'items':len(records),'units':sum(usage.values())}
 
 class Handler(BaseHTTPRequestHandler):
@@ -252,6 +362,17 @@ class Handler(BaseHTTPRequestHandler):
         if path=='/api/users':
             if identity['role']!='admin':return error(self,'Admin only',403)
             respond_json(self,admin_users());return
+        if path=='/api/backup':
+            if identity['role']!='admin':return error(self,'Admin only',403)
+            with LOCK:
+                snapshot=backup_db('manual')
+                payload=snapshot.read_bytes()
+            self.binary(payload,'application/octet-stream',attachment='rackflow-full-backup.db');return
+        if path=='/api/storage-status':
+            if identity['role']!='admin':return error(self,'Admin only',403)
+            with connect() as db:
+                counts={t:db.execute(f'SELECT COUNT(*) FROM {t}').fetchone()[0] for t in ('racks','stock','users','movements')}
+            respond_json(self,{'persistent':True,'db_path':str(DB),'backup_files':len(list(BACKUPS.glob('*.db'))),'volume_id':EXPECTED_ID,'external_guard_set':bool(os.getenv('RACKFLOW_EXPECTED_VOLUME_ID')),'counts':counts});return
         if path in ('/api/export','/api/template'):
             if identity['role']!='admin':return error(self,'Admin only',403)
             self.binary(make_excel(path.endswith('template')),'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',attachment='rack_stock_template.xlsx' if path.endswith('template') else 'rack_stock_current.xlsx');return
@@ -264,7 +385,7 @@ class Handler(BaseHTTPRequestHandler):
     def binary(self,payload,ctype,attachment=None):
         self.send_response(200);self.send_header('Content-Type',ctype);self.send_header('Content-Length',str(len(payload)))
         if attachment:self.send_header('Content-Disposition',f'attachment; filename="{attachment}"')
-        self.send_header('Cache-Control','no-store');self.end_headers();self.wfile.write(payload)
+        self.send_header('Cache-Control','no-store');self.send_header('X-Content-Type-Options','nosniff');self.end_headers();self.wfile.write(payload)
     def do_POST(self):
         path=urlparse(self.path).path
         try:
