@@ -12,10 +12,31 @@
 .model-out-row .row-take-btn{font-size:14px;padding:12px 8px;white-space:nowrap}
 .model-out-row.is-empty{opacity:.7}
 @media(max-width:440px){.model-out-row{grid-template-columns:minmax(0,1fr) 72px 96px;gap:6px;padding:8px}.model-out-row .row-take-btn{font-size:12px;padding:12px 5px}.model-out-name{font-size:13px}.model-out-qty{padding:10px 5px}}
+
+/* Employee model locator: read-only search of the existing Railway rack data. */
+.search-launch{width:100%;margin-top:14px;background:#e8f3ff;color:#164163;border:1px solid #a9cde3}
+.search-result{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:10px;align-items:center;background:#f7faff;border:1px solid #dfebf5;border-radius:12px;padding:12px;margin:8px 0}
+.search-result-main{min-width:0;overflow-wrap:anywhere}
+.search-result-model{display:block;font-size:16px;font-weight:800;color:#14263e}
+.search-result-rack{display:block;margin-top:4px;font-size:14px;color:#265c88;font-weight:750}
+.search-result-qty{display:block;margin-top:4px;font-size:13px;color:#50647b}
+.search-result-qty.out-of-stock{color:#ad3e4a}
+.search-result .btn{font-size:13px;white-space:nowrap;padding:11px 12px}
+@media(max-width:390px){.search-result{grid-template-columns:minmax(0,1fr) 94px;gap:6px;padding:10px}.search-result .btn{font-size:12px;padding:11px 7px}}
 </style></head><body><header><div class="brand">Rack<span>Flow</span></div><div class="buttons"><button class="toplink hidden" id="adminToggle">Admin / Excel</button><button class="toplink hidden" id="logoutBtn">Log out</button></div></header><main>
 <section id="loginSection" class="card"><h1 class="title">Employee login</h1><p class="sub">Enter the username and password given by the warehouse owner.</p><div class="label">Username</div><input id="loginUser" autocomplete="username" placeholder="employee01 or admin"><div class="label">Password</div><input id="loginPass" type="password" autocomplete="current-password"><button class="btn" id="loginBtn" style="margin-top:14px;width:100%">Log in</button><div id="loginMsg" class="hint" style="margin-top:8px"></div></section>
 <section id="worker" class="hidden"><h1 class="title">Scan a rack</h1><p class="sub">Scan the QR sticker, then choose whether stock is coming IN or going OUT.</p>
-<div class="card"><div class="step">STEP 1 — IDENTIFY RACK</div><div class="hint">Logged in as <strong id="employeeName"></strong></div><input id="employee" type="hidden"><div class="label">Rack QR code</div><div class="buttons"><button id="scanBtn" class="btn">📷 Open Camera</button><button id="stopBtn" class="btn secondary hidden">Stop Camera</button></div><div class="reader hidden" id="reader"><video id="video" playsinline muted autoplay></video><div class="scanborder"></div></div><canvas id="canvas"></canvas><div id="cameraError" class="hint" style="margin-top:10px"></div><div class="label">Or enter rack number / use handheld scanner</div><div class="buttons"><input id="rackInput" class="mono" placeholder="e.g. A-001" style="flex:2"><button id="openBtn" class="btn secondary" style="flex:1">Open Rack</button></div><div class="hint" style="margin-top:9px">For phone camera scanning, open this app with HTTPS. A basic HTTP Wi-Fi address is not camera-enabled in most browsers.</div></div>
+<div class="card"><div class="step">STEP 1 — IDENTIFY RACK</div><div class="hint">Logged in as <strong id="employeeName"></strong></div><input id="employee" type="hidden"><button id="searchToggleBtn" class="btn search-launch" type="button">🔎 Search Model / Find Rack</button><div class="label">Rack QR code</div><div class="buttons"><button id="scanBtn" class="btn">📷 Open Camera</button><button id="stopBtn" class="btn secondary hidden">Stop Camera</button></div><div class="reader hidden" id="reader"><video id="video" playsinline muted autoplay></video><div class="scanborder"></div></div><canvas id="canvas"></canvas><div id="cameraError" class="hint" style="margin-top:10px"></div><div class="label">Or enter rack number / use handheld scanner</div><div class="buttons"><input id="rackInput" class="mono" placeholder="e.g. A-001" style="flex:2"><button id="openBtn" class="btn secondary" style="flex:1">Open Rack</button></div><div class="hint" style="margin-top:9px">For phone camera scanning, open this app with HTTPS. A basic HTTP Wi-Fi address is not camera-enabled in most browsers.</div></div>
+<div class="card hidden" id="searchPanel">
+  <div class="step">FIND MODEL LOCATION</div>
+  <h2 class="title" style="font-size:23px;margin-top:5px">Search Model</h2>
+  <p class="sub">Type any phone model to see which rack it is in and the quantity available. You can search part of a name, such as “A15” or “iPhone 13”.</p>
+  <label for="modelSearchInput" class="label" style="display:block">Phone model</label>
+  <input id="modelSearchInput" type="search" autocomplete="off" placeholder="Search e.g. Oppo A15" aria-label="Search phone model">
+  <div id="modelSearchCount" class="hint" role="status" aria-live="polite" style="margin-top:12px"></div>
+  <div id="modelSearchResults"></div>
+  <button type="button" class="btn secondary" id="closeSearchBtn" style="width:100%;margin-top:12px">Close Search</button>
+</div>
 <div class="card hidden" id="rackCard"><div class="step">STEP 2 — CHOOSE ACTION</div><div class="rackname" id="rackHeading"></div><div class="metrics"><div class="metric"><strong id="used">0</strong><small>In stock</small></div><div class="metric"><strong id="capacity">0</strong><small>Rack capacity</small></div><div class="metric"><strong id="left">0</strong><small>Capacity left</small></div></div><div class="buttons" id="actionButtons"><button class="btn green bigbtn" id="inBtn">＋ IN</button><button class="btn red bigbtn" id="outBtn">− OUT</button></div>
 <div id="outPanel" class="hidden"><h3>Stock OUT</h3><p class="sub">Enter quantity beside a model, then tap its Take Out button.</p><div id="models" class="model-list"></div><button class="btn secondary cancelBtn" style="width:100%;margin-top:12px">Back</button></div>
 <div id="inPanel" class="hidden"><h3>Stock IN</h3><p class="sub">Enter the phone model and incoming quantity.</p><div class="label">Model name</div><input id="inModel" list="knownModels" placeholder="e.g. iPhone 13 D-15"><datalist id="knownModels"></datalist><div class="label">Quantity to put in</div><input id="inQty" type="number" min="1" step="1" inputmode="numeric" placeholder="e.g. 10"><p id="roomHint" class="hint"></p><div class="buttons"><button class="btn green" id="putBtn">Put In</button><button class="btn secondary cancelBtn">Back</button></div></div></div>
@@ -25,7 +46,47 @@
 const $=id=>document.getElementById(id); let state={racks:[],movements:[]},rack=null,stream=null,timer=null,scanRunning=false,busy=false,detector=null,identity=null;
 const safe=s=>String(s??'').replace(/[&<>"']/g,x=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[x]));
 async function api(path,opts){let r=await fetch(path,opts),j=await r.json();if(!r.ok)throw Error(j.error||'Request failed');return j}
-async function refresh(){state=await api('/api/state');if(rack)rack=state.racks.find(x=>x.rack===rack.rack)||null;if(rack)showRack();$('qrGrid').innerHTML=state.racks.map(r=>`<div class="qr"><img loading="lazy" src="/api/qr/${encodeURIComponent(r.rack)}" alt="QR ${safe(r.rack)}"><b>${safe(r.rack)}</b></div>`).join('');$('movementList').innerHTML=(state.movements||[]).slice(0,35).map(m=>`<div class="stockrow"><span><b>${safe(m.action)}</b> ${safe(m.model)}<div class="hint">${safe(m.employee)} · ${safe(m.rack)} · ${safe(m.at).slice(0,19)}</div></span><b>${m.qty}</b></div>`).join('')||'No movements yet';}
+async function refresh(){state=await api('/api/state');if(rack)rack=state.racks.find(x=>x.rack===rack.rack)||null;if(rack)showRack();renderModelSearch();$('qrGrid').innerHTML=state.racks.map(r=>`<div class="qr"><img loading="lazy" src="/api/qr/${encodeURIComponent(r.rack)}" alt="QR ${safe(r.rack)}"><b>${safe(r.rack)}</b></div>`).join('');$('movementList').innerHTML=(state.movements||[]).slice(0,35).map(m=>`<div class="stockrow"><span><b>${safe(m.action)}</b> ${safe(m.model)}<div class="hint">${safe(m.employee)} · ${safe(m.rack)} · ${safe(m.at).slice(0,19)}</div></span><b>${m.qty}</b></div>`).join('')||'No movements yet';}
+// Find a model across all racks without altering any inventory data.
+function normalizeModelSearch(value){return String(value||'').toLowerCase().replace(/[^a-z0-9]/g,'')}
+function renderModelSearch(){
+  const input=$('modelSearchInput');
+  const query=normalizeModelSearch(input.value.trim());
+  const results=$('modelSearchResults');
+  const count=$('modelSearchCount');
+  if(!query){count.textContent='Enter a model name to find its rack.';results.innerHTML='';return}
+  const matches=[];
+  for(const r of (state.racks||[])){
+    for(const m of (r.models||[])){
+      if(normalizeModelSearch(m.model).includes(query))matches.push({rack:r.rack,model:m.model,qty:Number(m.qty)||0});
+    }
+  }
+  matches.sort((a,b)=>(b.qty>0)-(a.qty>0) || a.model.localeCompare(b.model,undefined,{numeric:true}) || a.rack.localeCompare(b.rack,undefined,{numeric:true}));
+  if(!matches.length){count.textContent='No matching model found in the current rack stock.';results.innerHTML='';return}
+  const displayed=matches.slice(0,80);
+  count.textContent=`Found ${matches.length} matching model location${matches.length===1?'':'s'}${matches.length>displayed.length?' (showing first 80)':''}.`;
+  results.innerHTML=displayed.map(m=>`<div class="search-result">
+    <div class="search-result-main">
+      <span class="search-result-model">${safe(m.model)}</span>
+      <span class="search-result-rack">Rack: ${safe(m.rack)}</span>
+      <span class="search-result-qty${m.qty<=0?' out-of-stock':''}">${m.qty>0?`${m.qty} pcs available`:'Out of stock (0 pcs)'}</span>
+    </div>
+    <button class="btn secondary search-open-rack" type="button" data-rack="${safe(m.rack)}">Open Rack</button>
+  </div>`).join('');
+}
+function toggleModelSearch(open){
+  $('searchPanel').classList.toggle('hidden',!open);
+  if(open){renderModelSearch();$('searchPanel').scrollIntoView({behavior:'smooth',block:'start'});$('modelSearchInput').focus()}
+}
+$('searchToggleBtn').addEventListener('click',()=>toggleModelSearch($('searchPanel').classList.contains('hidden')));
+$('closeSearchBtn').addEventListener('click',()=>toggleModelSearch(false));
+$('modelSearchInput').addEventListener('input',renderModelSearch);
+$('modelSearchResults').addEventListener('click',event=>{
+  const button=event.target.closest('.search-open-rack');
+  if(!button)return;
+  openRack(button.dataset.rack);
+  toggleModelSearch(false);
+});
 function note(txt,error=false){$('notice').innerHTML=`<div class="notice ${error?'error':''}">${safe(txt)}</div>`;}
 function showRack(){
   if(!rack){$('rackCard').classList.add('hidden');return}
