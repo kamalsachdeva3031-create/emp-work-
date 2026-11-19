@@ -28,7 +28,7 @@
 </style></head><body><header><div class="brand">Rack<span>Flow</span></div><div class="buttons"><button class="toplink hidden" id="shopToggle">Shop Orders</button><button class="toplink hidden" id="adminToggle">Admin / Excel</button><button class="toplink hidden" id="logoutBtn">Log out</button></div></header><main>
 <section id="loginSection" class="card"><h1 class="title">Employee login</h1><p class="sub">Enter the username and password given by the warehouse owner.</p><div class="label">Username</div><input id="loginUser" autocomplete="username" placeholder="employee01 or admin"><div class="label">Password</div><input id="loginPass" type="password" autocomplete="current-password"><button class="btn" id="loginBtn" style="margin-top:14px;width:100%">Log in</button><div id="loginMsg" class="hint" style="margin-top:8px"></div></section>
 <section id="worker" class="hidden"><h1 class="title">Scan a rack</h1><p class="sub">Scan the QR sticker, then choose whether stock is coming IN or going OUT.</p>
-<div class="card"><div class="step">STEP 1 — IDENTIFY RACK</div><div class="hint">Logged in as <strong id="employeeName"></strong></div><input id="employee" type="hidden"><button id="searchToggleBtn" class="btn search-launch" type="button">🔎 Search Model / Find Rack</button><div class="label">Rack QR code</div><div class="buttons"><button id="scanBtn" class="btn">📷 Open Camera</button><button id="stopBtn" class="btn secondary hidden">Stop Camera</button></div><div class="reader hidden" id="reader"><video id="video" playsinline muted autoplay></video><div class="scanborder"></div></div><canvas id="canvas"></canvas><div id="cameraError" class="hint" style="margin-top:10px"></div><div class="label">Or enter rack number / use handheld scanner</div><div class="buttons"><input id="rackInput" class="mono" placeholder="e.g. A-001" style="flex:2"><button id="openBtn" class="btn secondary" style="flex:1">Open Rack</button></div><div class="hint" style="margin-top:9px">For phone camera scanning, open this app with HTTPS. A basic HTTP Wi-Fi address is not camera-enabled in most browsers.</div></div>
+<div class="card"><div class="step">STEP 1 — IDENTIFY RACK</div><div class="hint" style="font-size:11px;color:#53708a;margin-top:6px">QR FIX v3 • 19 NOV 2026</div><div class="hint">Logged in as <strong id="employeeName"></strong></div><input id="employee" type="hidden"><button id="searchToggleBtn" class="btn search-launch" type="button">🔎 Search Model / Find Rack</button><div class="label">Rack QR code</div><div class="buttons"><button id="scanBtn" class="btn">📷 Open Camera</button><button id="stopBtn" class="btn secondary hidden">Stop Camera</button></div><div class="reader hidden" id="reader"><video id="video" playsinline muted autoplay></video><div class="scanborder"></div></div><canvas id="canvas"></canvas><div id="cameraError" class="hint" style="margin-top:10px"></div><div class="label">Or enter rack number / use handheld scanner</div><div class="buttons"><input id="rackInput" class="mono" placeholder="e.g. A-001" style="flex:2"><button id="openBtn" class="btn secondary" style="flex:1">Open Rack</button></div><div class="hint" style="margin-top:9px">For phone camera scanning, open this app with HTTPS. A basic HTTP Wi-Fi address is not camera-enabled in most browsers.</div></div>
 <div class="card hidden" id="searchPanel">
   <div class="step">FIND MODEL LOCATION</div>
   <h2 class="title" style="font-size:23px;margin-top:5px">Search Model</h2>
@@ -125,55 +125,75 @@ function showRack(){
   $('knownModels').innerHTML=Array.from(new Set(state.racks.flatMap(x=>x.models.map(y=>y.model)))).map(m=>`<option value="${safe(m)}"></option>`).join('');
   $('roomHint').textContent=`Capacity left: ${rack.available} pieces`;
 }
-// Old stickers sometimes contain a link (/?rack=RACK%202), not plain rack text.
-// Both in-app scanning and opening the sticker with a phone camera work.
+// QR FIX v3 — accepts phone-camera links, in-app scanned text and encoded rack IDs.
+// %20 is an encoded space: RACK%201 -> RACK 1.
 function parseRackCode(value){
   let text=String(value??'').trim();
   if(!text)return '';
+  const getParam=(v)=>{
+    const params=new URLSearchParams(v);
+    for(const [k, val] of params){
+      if(['rack','rack_id','racknumber','rack_number'].includes(k.trim().toLowerCase()))return val;
+    }
+    return null;
+  };
   try{
     if(/^(?:https?:\/\/|\/|\?)/i.test(text)){
       const url=new URL(text,window.location.origin);
-      for(const [key,val] of url.searchParams){
-        if(key.toLowerCase()==='rack' || key.toLowerCase()==='rack_id'){
-          text=val;
-          break;
-        }
-      }
-    }else if(/(?:^|[?&])rack(?:_id)?=/i.test(text)){
-      const query=text.includes('?')?text.slice(text.indexOf('?')+1):text;
-      const params=new URLSearchParams(query);
-      for(const [key,val] of params){
-        if(key.toLowerCase()==='rack' || key.toLowerCase()==='rack_id'){
-          text=val;
-          break;
-        }
-      }
+      const fromQuery=getParam(url.search);
+      if(fromQuery!==null)text=fromQuery;
+    }else if(/(?:^|[?&])(?:rack|rack_id|racknumber|rack_number)=/i.test(text)){
+      const fromQuery=getParam(text.includes('?')?text.slice(text.indexOf('?')+1):text);
+      if(fromQuery!==null)text=fromQuery;
     }
-  }catch(_error){/* Invalid link: try as an ordinary rack name. */}
-  // Handle encoded plain rack IDs as well as normal text.
-  for(let i=0;i<2 && /%[0-9A-Fa-f]{2}/.test(text);i++){
-    try{text=decodeURIComponent(text.replace(/\+/g,' '))}catch(_error){break}
+  }catch(e){ /* Use the original sticker text if URL is invalid */ }
+  // Resolve up to 3 nested encodings, including RACK%25201, preserving malformed raw text.
+  for(let i=0;i<3;i++){
+    const before=text;
+    try{
+      text=decodeURIComponent(text.replace(/\+/g,' '));
+    }catch(e){ break; }
+    if(text===before)break;
   }
-  return text.trim().toUpperCase();
+  return text.replace(/\s+/g,' ').trim().toUpperCase();
+}
+function rackKey(value){
+  const cleaned=parseRackCode(value).replace(/[^A-Z0-9]/g,'');
+  // RACK 001, RACK-1 and RACK1 match if the data contains only one such rack.
+  return cleaned.replace(/^(.*?)(\d+)$/,(_all,prefix,digits)=>prefix+String(Number(digits)));
+}
+function findRack(id){
+  const name=parseRackCode(id);
+  if(!name)return {found:null,matches:[]};
+  const racks=state.racks||[];
+  const exact=racks.filter(r=>r.rack.toUpperCase()===name);
+  if(exact.length===1)return {found:exact[0],matches:exact};
+  const same=racks.filter(r=>rackKey(r.rack)===rackKey(name));
+  if(same.length===1)return {found:same[0],matches:same};
+  // Support old QR stickers that use RACK 1 when the master calls it just "1";
+  // never select automatically if the result could refer to multiple racks.
+  if(same.length===0 && /^RACK\d+$/.test(rackKey(name))){
+    const short=rackKey(name).slice(4);
+    const aliases=racks.filter(r=>rackKey(r.rack)===short);
+    if(aliases.length===1)return {found:aliases[0],matches:aliases};
+    if(aliases.length>1)return {found:null,matches:aliases};
+  }
+  return {found:null,matches:same};
 }
 function openRack(code){
   const id=parseRackCode(code);
-  const normalized=s=>String(s).toUpperCase().replace(/[^A-Z0-9]/g,'');
-  // Preserve exact matches. Only ignore spacing/dashes if there is one unique match.
-  const exact=state.racks.find(r=>r.rack.toUpperCase()===id);
-  let matches=exact?[exact]:state.racks.filter(r=>normalized(r.rack)===normalized(id));
-  // Last-resort match for RACK 2 versus RACK 002, only when unambiguous.
-  if(!matches.length && id){
-    const canonical=s=>normalized(s).replace(/^(.*?)(\d+)$/,(_all,prefix,num)=>prefix+String(Number(num)));
-    matches=state.racks.filter(r=>canonical(r.rack)===canonical(id));
-  }
-  if(matches.length!==1){
-    note(matches.length>1?`Rack code ${id} matches multiple racks. Enter the full rack number.`:`Rack ${id||'(blank)'} not found in Excel master. Check that this rack exists in Admin / Excel.`,true);
+  const result=findRack(id);
+  if(!result.found){
+    const sample=(state.racks||[]).slice(0,5).map(r=>r.rack).join(', ');
+    note(result.matches.length>1
+      ?`More than one rack matches ${id}. Enter the full rack name. (QR FIX v3)`
+      :`Rack ${id||'(blank)'} not found in ${state.racks?.length||0} loaded racks. Sample IDs: ${sample||'(none)'} (QR FIX v3)`,true);
+    $('rackInput').value=id;
     return false;
   }
-  rack=matches[0];
+  rack=result.found;
   $('rackInput').value=rack.rack;
-  $('models').innerHTML=''; // Clear quantities left over from another rack.
+  $('models').innerHTML='';
   $('notice').innerHTML='';
   showRack();choose('');stopCamera();
   $('rackCard').scrollIntoView({behavior:'smooth',block:'start'});
@@ -182,7 +202,7 @@ function openRack(code){
 function openRackFromQRLink(){
   const url=new URL(window.location.href);
   for(const [key,val] of url.searchParams){
-    if(key.toLowerCase()==='rack'||key.toLowerCase()==='rack_id'){
+    if(['rack','rack_id','racknumber','rack_number'].includes(key.toLowerCase())){
       if(val.trim())openRack(val);
       return;
     }
@@ -353,4 +373,3 @@ shopRenderCart();
 
 initial();setInterval(()=>{if(!busy&&identity?.role!=='guest')refresh().catch(()=>{})},15000);
 </script></body></html>
-
