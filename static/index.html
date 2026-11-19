@@ -23,7 +23,7 @@
 .search-result-qty.out-of-stock{color:#ad3e4a}
 .search-result .btn{font-size:13px;white-space:nowrap;padding:11px 12px}
 @media(max-width:390px){.search-result{grid-template-columns:minmax(0,1fr) 94px;gap:6px;padding:10px}.search-result .btn{font-size:12px;padding:11px 7px}}
-</style></head><body><header><div class="brand">Rack<span>Flow</span></div><div class="buttons"><button class="toplink hidden" id="adminToggle">Admin / Excel</button><button class="toplink hidden" id="logoutBtn">Log out</button></div></header><main>
+</style></head><body><header><div class="brand">Rack<span>Flow</span></div><div class="buttons"><button class="toplink hidden" id="shopToggle">Shop Orders</button><button class="toplink hidden" id="adminToggle">Admin / Excel</button><button class="toplink hidden" id="logoutBtn">Log out</button></div></header><main>
 <section id="loginSection" class="card"><h1 class="title">Employee login</h1><p class="sub">Enter the username and password given by the warehouse owner.</p><div class="label">Username</div><input id="loginUser" autocomplete="username" placeholder="employee01 or admin"><div class="label">Password</div><input id="loginPass" type="password" autocomplete="current-password"><button class="btn" id="loginBtn" style="margin-top:14px;width:100%">Log in</button><div id="loginMsg" class="hint" style="margin-top:8px"></div></section>
 <section id="worker" class="hidden"><h1 class="title">Scan a rack</h1><p class="sub">Scan the QR sticker, then choose whether stock is coming IN or going OUT.</p>
 <div class="card"><div class="step">STEP 1 — IDENTIFY RACK</div><div class="hint">Logged in as <strong id="employeeName"></strong></div><input id="employee" type="hidden"><button id="searchToggleBtn" class="btn search-launch" type="button">🔎 Search Model / Find Rack</button><div class="label">Rack QR code</div><div class="buttons"><button id="scanBtn" class="btn">📷 Open Camera</button><button id="stopBtn" class="btn secondary hidden">Stop Camera</button></div><div class="reader hidden" id="reader"><video id="video" playsinline muted autoplay></video><div class="scanborder"></div></div><canvas id="canvas"></canvas><div id="cameraError" class="hint" style="margin-top:10px"></div><div class="label">Or enter rack number / use handheld scanner</div><div class="buttons"><input id="rackInput" class="mono" placeholder="e.g. A-001" style="flex:2"><button id="openBtn" class="btn secondary" style="flex:1">Open Rack</button></div><div class="hint" style="margin-top:9px">For phone camera scanning, open this app with HTTPS. A basic HTTP Wi-Fi address is not camera-enabled in most browsers.</div></div>
@@ -41,6 +41,20 @@
 <div id="outPanel" class="hidden"><h3>Stock OUT</h3><p class="sub">Enter quantity beside a model, then tap its Take Out button.</p><div id="models" class="model-list"></div><button class="btn secondary cancelBtn" style="width:100%;margin-top:12px">Back</button></div>
 <div id="inPanel" class="hidden"><h3>Stock IN</h3><p class="sub">Enter the phone model and incoming quantity.</p><div class="label">Model name</div><input id="inModel" list="knownModels" placeholder="e.g. iPhone 13 D-15"><datalist id="knownModels"></datalist><div class="label">Quantity to put in</div><input id="inQty" type="number" min="1" step="1" inputmode="numeric" placeholder="e.g. 10"><p id="roomHint" class="hint"></p><div class="buttons"><button class="btn green" id="putBtn">Put In</button><button class="btn secondary cancelBtn">Back</button></div></div></div>
 <div id="notice" role="status" aria-live="polite"></div></section>
+<section id="shopOrders" class="hidden">
+<div class="buttons no-print"><button id="shopBack" class="btn secondary">← Back to RackFlow</button><button id="shopRefresh" class="btn secondary">Refresh Orders</button></div>
+<div class="card"><h1 class="title">Shop Orders</h1><p class="sub">Shop staff can request items. Warehouse staff can pick from the assigned rack.</p>
+<div class="buttons"><button id="shopPlaceTab" class="btn">Place Order</button><button id="shopPickTab" class="btn secondary">Warehouse Orders</button></div>
+<div id="shopPlacePanel"><div class="label">Shop name</div><input id="shopName" placeholder="Enter shop name" maxlength="100">
+<div class="label">1. Variety</div><select id="shopVariety"></select>
+<div class="label">2. Model</div><select id="shopModel"></select>
+<div id="shopStockHint" class="hint" style="margin-top:8px"></div>
+<div class="label">3. Quantity</div><input id="shopQty" type="number" inputmode="numeric" min="1" step="1" placeholder="How many pieces?">
+<button id="shopAdd" class="btn secondary" style="width:100%;margin-top:12px">+ Add Item to Order</button>
+<h3>Order list</h3><div id="shopCart"></div>
+<button id="shopSubmit" class="btn green" style="width:100%;margin-top:14px">Submit Order</button></div>
+<div id="shopPickPanel" class="hidden"><h3>Orders from shops</h3><div id="shopOrderList"></div></div>
+<div id="shopNotice" role="status" aria-live="polite"></div></div></section>
 <section id="admin" class="hidden"><div class="buttons no-print"><button class="btn secondary" id="backWorker">← Employee Scanner</button><button class="btn secondary" id="reloadBtn">Refresh</button></div><h1 class="title" style="margin-top:18px">Excel rack master</h1><p class="sub">Edit the Excel file to control rack numbers, assigned models, quantities, and capacity. Upload it when finished.</p><div class="card no-print"><div class="label">Download</div><div class="buttons"><a class="btn" href="/api/export" style="text-decoration:none;text-align:center">Download Current Stock Excel</a><a class="btn secondary" href="/api/template" style="text-decoration:none;text-align:center">Example Template</a><a class="btn secondary" href="/api/backup" style="text-decoration:none;text-align:center">Download Full Database Backup</a><a class="btn secondary" target="_blank" rel="noopener" href="/api/storage-status" style="text-decoration:none;text-align:center">Storage Status</a></div><p class="hint">Save the full backup on your computer. It includes rack stock, employee accounts (password hashes), and history. Enable Railway volume backups too.</p><div class="label">Replace rack master from Excel</div><input type="file" id="excelFile" accept=".xlsx" class="file"><button id="uploadBtn" class="btn" style="margin-top:10px">Upload Excel</button><p class="callout">Important: importing Excel replaces the current stock numbers. Download the latest file first so employee transactions aren't overwritten.</p></div><div class="card"><h3>Print rack QR barcode stickers</h3><p class="hint">The QR represents the rack number. These stickers work with the phone scanner in the app.</p><button class="btn no-print" onclick="window.print()">Print QR Labels</button><div class="printgrid" id="qrGrid"></div></div><div class="card no-print"><h3>Employees</h3><p class="hint">Create a separate username and password for each employee. Creating an existing name resets its password.</p><div class="grid2"><input id="newUser" placeholder="employee01"><input id="newPass" placeholder="Password (8+ chars)"></div><button class="btn" id="addUserBtn" style="margin-top:10px">Create / reset employee</button><div id="userList"></div></div><div class="card no-print"><h3>Recent stock movements</h3><div id="movementList"></div></div></section>
 </main><script>
 const $=id=>document.getElementById(id); let state={racks:[],movements:[]},rack=null,stream=null,timer=null,scanRunning=false,busy=false,detector=null,identity=null;
@@ -151,7 +165,7 @@ async function movement(type, selectedModel=null, selectedQty=null){
   }catch(e){note(e.message,true)}
   finally{busy=false;document.querySelectorAll('.row-take-btn').forEach(b=>b.disabled=Number(b.closest('.model-out-row')?.querySelector('.model-out-qty')?.max||0)<=0)}
 }
-function admin(open){$('worker').classList.toggle('hidden',open);$('admin').classList.toggle('hidden',!open);stopCamera();window.scrollTo({top:0,behavior:'smooth'})}
+function admin(open){$('shopOrders').classList.add('hidden');$('worker').classList.toggle('hidden',open);$('admin').classList.toggle('hidden',!open);stopCamera();window.scrollTo({top:0,behavior:'smooth'})}
 async function upload(){let f=$('excelFile').files[0];if(!f)return note('Choose an Excel file.',true);if(!confirm('Replace the current stock with this Excel master? Download latest first!'))return;try{let result=await api('/api/import',{method:'POST',headers:{'Content-Type':'application/octet-stream'},body:await f.arrayBuffer()});rack=null;await refresh();$('excelFile').value='';alert(`Imported ${result.racks} racks, ${result.items} models and ${result.units} pieces.`)}catch(e){alert(e.message)}}
 function cameraMessage(txt){$('cameraError').textContent=txt}
 async function loadFallback(){if(window.jsQR)return true;return await new Promise(resolve=>{let s=document.createElement('script');s.src='/jsQR.js';s.onload=()=>resolve(!!window.jsQR);s.onerror=()=>{let c=document.createElement('script');c.src='https://cdn.jsdelivr.net/npm/jsqr@1.4.0/dist/jsQR.js';c.onload=()=>resolve(!!window.jsQR);c.onerror=()=>resolve(false);document.head.appendChild(c)};document.head.appendChild(s)})}
@@ -175,13 +189,85 @@ $('models').addEventListener('keydown',e=>{
 });
 $('putBtn').onclick=()=>movement('in');$('adminToggle').onclick=()=>admin($('admin').classList.contains('hidden'));$('backWorker').onclick=()=>admin(false);$('reloadBtn').onclick=refresh;$('uploadBtn').onclick=upload;
 async function initial(){try{identity=await api('/api/me');if(identity.role==='guest'){showLogin();return}showLoggedIn();await refresh()}catch(e){$('loginMsg').textContent=e.message}};
-function showLogin(){$('loginSection').classList.remove('hidden');$('worker').classList.add('hidden');$('admin').classList.add('hidden');$('adminToggle').classList.add('hidden');$('logoutBtn').classList.add('hidden');}
-function showLoggedIn(){$('loginSection').classList.add('hidden');$('worker').classList.remove('hidden');$('logoutBtn').classList.remove('hidden');$('employee').value=identity.username;$('employeeName').textContent=identity.username;$('adminToggle').classList.toggle('hidden',identity.role!=='admin');}
+function showLogin(){$('loginSection').classList.remove('hidden');$('worker').classList.add('hidden');$('admin').classList.add('hidden');$('adminToggle').classList.add('hidden');$('shopToggle').classList.add('hidden');$('shopOrders').classList.add('hidden');$('logoutBtn').classList.add('hidden');}
+function showLoggedIn(){$('loginSection').classList.add('hidden');$('worker').classList.remove('hidden');$('logoutBtn').classList.remove('hidden');$('employee').value=identity.username;$('employeeName').textContent=identity.username;$('adminToggle').classList.toggle('hidden',identity.role!=='admin');$('shopToggle').classList.remove('hidden');}
 $('loginBtn').onclick=async()=>{try{identity=await api('/api/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({username:$('loginUser').value,password:$('loginPass').value})});$('loginPass').value='';showLoggedIn();await refresh()}catch(e){$('loginMsg').textContent=e.message}};
 $('loginPass').addEventListener('keydown',e=>{if(e.key==='Enter')$('loginBtn').click()});
 $('logoutBtn').onclick=async()=>{await api('/api/logout',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});identity=null;stopCamera();showLogin()};
 async function refreshUsers(){if(identity?.role!=='admin')return;let users=await api('/api/users');$('userList').innerHTML=users.map(u=>`<div class="stockrow"><span>${safe(u.username)} — ${u.active?'Active':'Disabled'}</span><button class="btn secondary" data-name="${safe(u.username)}" data-active="${u.active?0:1}">${u.active?'Disable':'Enable'}</button></div>`).join('')||'<p>No employees yet.</p>';document.querySelectorAll('#userList button').forEach(b=>b.onclick=async()=>{await api('/api/user-status',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({username:b.dataset.name,active:b.dataset.active==='1'})});await refreshUsers()})}
 $('addUserBtn').onclick=async()=>{try{await api('/api/users',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({username:$('newUser').value,password:$('newPass').value})});$('newPass').value='';await refreshUsers();alert('Employee account saved')}catch(e){alert(e.message)}};
 const oldAdmin=admin;admin=function(open){if(open&&identity?.role!=='admin')return;oldAdmin(open);if(open)refreshUsers().catch(e=>alert(e.message))};
+
+// Shop Orders is isolated from the existing scanner, Excel and admin UI.
+let shopCatalog=[],shopCart=[],shopOrdersData=[],shopMode='place';
+function shopMessage(message,isError=false){$('shopNotice').innerHTML=`<div class="notice ${isError?'error':''}">${safe(message)}</div>`;}
+function shopOpen(open){
+  $('shopOrders').classList.toggle('hidden',!open);
+  $('worker').classList.toggle('hidden',open);
+  $('admin').classList.add('hidden');
+  if(open){stopCamera();shopLoad().catch(e=>shopMessage(e.message,true));}
+  window.scrollTo({top:0,behavior:'smooth'});
+}
+async function shopLoad(){shopCatalog=await api('/api/shop-catalog');shopOrdersData=await api('/api/shop-orders');shopVarieties();shopRenderOrders();}
+function shopVarieties(){
+  let current=$('shopVariety').value;
+  const kinds=[...new Set(shopCatalog.map(x=>x.variety).filter(Boolean))].sort((a,b)=>a.localeCompare(b));
+  $('shopVariety').innerHTML='<option value="">Select variety</option>'+kinds.map(x=>`<option value="${safe(x)}">${safe(x)}</option>`).join('');
+  if(kinds.includes(current))$('shopVariety').value=current;
+  shopModels();
+}
+function shopModels(){
+ const v=$('shopVariety').value,current=$('shopModel').value;
+ const models=[...new Set(shopCatalog.filter(x=>x.variety===v).map(x=>x.model))].sort((a,b)=>a.localeCompare(b));
+ $('shopModel').innerHTML='<option value="">Select model</option>'+models.map(x=>`<option value="${safe(x)}">${safe(x)}</option>`).join('');
+ if(models.includes(current))$('shopModel').value=current;
+ shopHint();
+}
+function shopHint(){const v=$('shopVariety').value,m=$('shopModel').value;
+ const rows=shopCatalog.filter(x=>x.variety===v&&x.model===m);
+ $('shopStockHint').textContent=rows.length?`Available ${rows.reduce((a,x)=>a+x.qty,0)} pcs · Rack(s): ${rows.map(x=>x.rack).join(', ')}`:'Select variety and model';}
+function shopRenderCart(){
+ $('shopCart').innerHTML=shopCart.map((x,i)=>`<div class="stockrow"><span><strong>${safe(x.variety)} / ${safe(x.model)}</strong><div class="hint">${x.qty} pcs</div></span><button class="btn secondary" data-remove="${i}">Remove</button></div>`).join('')||'<div class="hint">No items added yet.</div>';
+ $('shopCart').querySelectorAll('[data-remove]').forEach(b=>b.onclick=()=>{shopCart.splice(Number(b.dataset.remove),1);shopRenderCart()});
+}
+function shopRenderOrders(){
+ $('shopOrderList').innerHTML=shopOrdersData.map(o=>{
+ const done=o.items.every(x=>x.picked===x.qty);
+ return `<div class="card" style="margin:12px 0"><strong>Order #${o.id} — ${safe(o.shop)}</strong><div class="hint">By ${safe(o.created_by)} · ${safe(o.created_at)} · ${done?'Completed':'Pending'}</div>`+
+ o.items.map(x=>`<div class="model-out-row" style="margin-top:10px"><div class="model-out-info"><span class="model-out-name">${safe(x.variety)} / ${safe(x.model)}</span><span class="model-out-stock">Rack ${safe(x.rack)} · ${x.picked}/${x.qty} picked</span></div><input class="model-out-qty" type="number" min="1" max="${x.qty-x.picked}" value="${Math.max(1,x.qty-x.picked)}" data-qty="${x.id}" ${x.picked===x.qty?'disabled':''}><button class="btn row-take-btn ${done?'secondary':''}" data-pick="${x.id}" ${x.picked===x.qty?'disabled':''}>${x.picked===x.qty?'Done':'Take Out'}</button></div>`).join('')+'</div>';
+ }).join('')||'<div class="hint">No shop orders yet.</div>';
+ $('shopOrderList').querySelectorAll('[data-pick]').forEach(b=>b.onclick=async()=>{
+  const id=Number(b.dataset.pick),q=Number($(`shopOrderList`).querySelector(`[data-qty="${id}"]`).value);
+  if(!Number.isInteger(q)||q<1)return shopMessage('Enter a valid take out quantity',true);
+  if(!confirm(`Take out ${q} pieces for this shop order?`))return;
+  b.disabled=true;
+  try{await api('/api/shop-pick',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({item_id:id,qty:q})});await shopLoad();await refresh();shopMessage('Take Out recorded and live rack stock updated.');}
+  catch(e){shopMessage(e.message,true);b.disabled=false;}
+ });
+}
+$('shopToggle').onclick=()=>shopOpen(true);
+$('shopBack').onclick=()=>{shopOpen(false);if(identity?.role==='admin'&&!$('admin').classList.contains('hidden'))admin(false)};
+$('shopRefresh').onclick=()=>shopLoad().catch(e=>shopMessage(e.message,true));
+$('shopVariety').onchange=shopModels;$('shopModel').onchange=shopHint;
+$('shopPlaceTab').onclick=()=>{shopMode='place';$('shopPlacePanel').classList.remove('hidden');$('shopPickPanel').classList.add('hidden')};
+$('shopPickTab').onclick=()=>{shopMode='pick';$('shopPlacePanel').classList.add('hidden');$('shopPickPanel').classList.remove('hidden');shopLoad().catch(e=>shopMessage(e.message,true))};
+$('shopAdd').onclick=()=>{
+ const variety=$('shopVariety').value,model=$('shopModel').value,qty=Number($('shopQty').value);
+ if(!variety||!model||!Number.isInteger(qty)||qty<1)return shopMessage('Choose variety, model and positive quantity.',true);
+ const available=shopCatalog.filter(x=>x.variety===variety&&x.model===model).reduce((a,x)=>a+x.qty,0);
+ const old=shopCart.find(x=>x.variety===variety&&x.model===model),total=qty+(old?.qty||0);
+ if(total>available)return shopMessage(`Only ${available} pieces available for this variety/model`,true);
+ if(old)old.qty=total;else shopCart.push({variety,model,qty});
+ $('shopQty').value='';shopRenderCart();shopMessage('Item added to order.');
+};
+$('shopSubmit').onclick=async()=>{
+ if(!shopCart.length)return shopMessage('Add at least one item.',true);
+ if(!$('shopName').value.trim())return shopMessage('Enter shop name.',true);
+ $('shopSubmit').disabled=true;
+ try{const r=await api('/api/shop-orders',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({shop:$('shopName').value.trim(),items:shopCart})});shopCart=[];shopRenderCart();await shopLoad();shopMessage(`Order #${r.order_id} submitted to warehouse.`);$('shopPickTab').click();}
+ catch(e){shopMessage(e.message,true)}finally{$('shopSubmit').disabled=false}
+};
+shopRenderCart();
+
 initial();setInterval(()=>{if(!busy&&identity?.role!=='guest')refresh().catch(()=>{})},15000);
 </script></body></html>
