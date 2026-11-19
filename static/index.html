@@ -125,18 +125,68 @@ function showRack(){
   $('knownModels').innerHTML=Array.from(new Set(state.racks.flatMap(x=>x.models.map(y=>y.model)))).map(m=>`<option value="${safe(m)}"></option>`).join('');
   $('roomHint').textContent=`Capacity left: ${rack.available} pieces`;
 }
+// Old stickers sometimes contain a link (/?rack=RACK%202), not plain rack text.
+// Both in-app scanning and opening the sticker with a phone camera work.
+function parseRackCode(value){
+  let text=String(value??'').trim();
+  if(!text)return '';
+  try{
+    if(/^(?:https?:\/\/|\/|\?)/i.test(text)){
+      const url=new URL(text,window.location.origin);
+      for(const [key,val] of url.searchParams){
+        if(key.toLowerCase()==='rack' || key.toLowerCase()==='rack_id'){
+          text=val;
+          break;
+        }
+      }
+    }else if(/(?:^|[?&])rack(?:_id)?=/i.test(text)){
+      const query=text.includes('?')?text.slice(text.indexOf('?')+1):text;
+      const params=new URLSearchParams(query);
+      for(const [key,val] of params){
+        if(key.toLowerCase()==='rack' || key.toLowerCase()==='rack_id'){
+          text=val;
+          break;
+        }
+      }
+    }
+  }catch(_error){/* Invalid link: try as an ordinary rack name. */}
+  // Handle encoded plain rack IDs as well as normal text.
+  for(let i=0;i<2 && /%[0-9A-Fa-f]{2}/.test(text);i++){
+    try{text=decodeURIComponent(text.replace(/\+/g,' '))}catch(_error){break}
+  }
+  return text.trim().toUpperCase();
+}
 function openRack(code){
-  const id=String(code||'').trim().toUpperCase();
+  const id=parseRackCode(code);
   const normalized=s=>String(s).toUpperCase().replace(/[^A-Z0-9]/g,'');
+  // Preserve exact matches. Only ignore spacing/dashes if there is one unique match.
   const exact=state.racks.find(r=>r.rack.toUpperCase()===id);
-  const matches=exact?[exact]:state.racks.filter(r=>normalized(r.rack)===normalized(id));
-  if(matches.length!==1){note(matches.length>1?`Rack code ${id} matches multiple racks. Enter the full rack number.`:`Rack ${id||'(blank)'} not found in Excel master.`,true);return}
+  let matches=exact?[exact]:state.racks.filter(r=>normalized(r.rack)===normalized(id));
+  // Last-resort match for RACK 2 versus RACK 002, only when unambiguous.
+  if(!matches.length && id){
+    const canonical=s=>normalized(s).replace(/^(.*?)(\d+)$/,(_all,prefix,num)=>prefix+String(Number(num)));
+    matches=state.racks.filter(r=>canonical(r.rack)===canonical(id));
+  }
+  if(matches.length!==1){
+    note(matches.length>1?`Rack code ${id} matches multiple racks. Enter the full rack number.`:`Rack ${id||'(blank)'} not found in Excel master. Check that this rack exists in Admin / Excel.`,true);
+    return false;
+  }
   rack=matches[0];
   $('rackInput').value=rack.rack;
   $('models').innerHTML=''; // Clear quantities left over from another rack.
   $('notice').innerHTML='';
   showRack();choose('');stopCamera();
   $('rackCard').scrollIntoView({behavior:'smooth',block:'start'});
+  return true;
+}
+function openRackFromQRLink(){
+  const url=new URL(window.location.href);
+  for(const [key,val] of url.searchParams){
+    if(key.toLowerCase()==='rack'||key.toLowerCase()==='rack_id'){
+      if(val.trim())openRack(val);
+      return;
+    }
+  }
 }
 function choose(type){$('actionButtons').classList.toggle('hidden',!!type);$('inPanel').classList.toggle('hidden',type!=='in');$('outPanel').classList.toggle('hidden',type!=='out')}
 async function movement(type, selectedModel=null, selectedQty=null){
@@ -190,10 +240,10 @@ $('models').addEventListener('keydown',e=>{
   }
 });
 $('putBtn').onclick=()=>movement('in');$('adminToggle').onclick=()=>admin($('admin').classList.contains('hidden'));$('backWorker').onclick=()=>admin(false);$('reloadBtn').onclick=refresh;$('uploadBtn').onclick=upload;
-async function initial(){try{identity=await api('/api/me');if(identity.role==='guest'){showLogin();return}showLoggedIn();await refresh()}catch(e){$('loginMsg').textContent=e.message}};
+async function initial(){try{identity=await api('/api/me');if(identity.role==='guest'){showLogin();return}showLoggedIn();await refresh();openRackFromQRLink()}catch(e){$('loginMsg').textContent=e.message}};
 function showLogin(){$('loginSection').classList.remove('hidden');$('worker').classList.add('hidden');$('admin').classList.add('hidden');$('adminToggle').classList.add('hidden');$('shopToggle').classList.add('hidden');$('shopOrders').classList.add('hidden');$('logoutBtn').classList.add('hidden');}
 function showLoggedIn(){$('loginSection').classList.add('hidden');$('worker').classList.remove('hidden');$('logoutBtn').classList.remove('hidden');$('employee').value=identity.username;$('employeeName').textContent=identity.username;$('adminToggle').classList.toggle('hidden',identity.role!=='admin');$('shopToggle').classList.remove('hidden');}
-$('loginBtn').onclick=async()=>{try{identity=await api('/api/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({username:$('loginUser').value,password:$('loginPass').value})});$('loginPass').value='';showLoggedIn();await refresh()}catch(e){$('loginMsg').textContent=e.message}};
+$('loginBtn').onclick=async()=>{try{identity=await api('/api/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({username:$('loginUser').value,password:$('loginPass').value})});$('loginPass').value='';showLoggedIn();await refresh();openRackFromQRLink()}catch(e){$('loginMsg').textContent=e.message}};
 $('loginPass').addEventListener('keydown',e=>{if(e.key==='Enter')$('loginBtn').click()});
 $('logoutBtn').onclick=async()=>{await api('/api/logout',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});identity=null;stopCamera();showLogin()};
 async function refreshUsers(){if(identity?.role!=='admin')return;let users=await api('/api/users');$('userList').innerHTML=users.map(u=>`<div class="stockrow"><span>${safe(u.username)} — ${u.active?'Active':'Disabled'}</span><button class="btn secondary" data-name="${safe(u.username)}" data-active="${u.active?0:1}">${u.active?'Disable':'Enable'}</button></div>`).join('')||'<p>No employees yet.</p>';document.querySelectorAll('#userList button').forEach(b=>b.onclick=async()=>{await api('/api/user-status',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({username:b.dataset.name,active:b.dataset.active==='1'})});await refreshUsers()})}
