@@ -133,6 +133,12 @@ def setup():
         raise RuntimeError("STORAGE SAFETY STOP: different Railway volume detected. Attach original volume; no inventory modified.")
     EXPECTED_ID=db_id
     GUARD_ACTIVE=True
+    # Additive migration: preserve existing rack stock, movements and employee logins.
+    with LOCK,connect() as db:
+        db.execute("CREATE TABLE IF NOT EXISTS varieties (rack TEXT NOT NULL, model TEXT NOT NULL, variety TEXT NOT NULL DEFAULT '', PRIMARY KEY(rack,model))")
+        db.execute('CREATE TABLE IF NOT EXISTS shop_orders (id INTEGER PRIMARY KEY AUTOINCREMENT, shop TEXT NOT NULL, created_by TEXT NOT NULL, created_at TEXT NOT NULL)')
+        db.execute('CREATE TABLE IF NOT EXISTS shop_order_items (id INTEGER PRIMARY KEY AUTOINCREMENT, order_id INTEGER NOT NULL, variety TEXT NOT NULL, model TEXT NOT NULL, rack TEXT NOT NULL, qty INTEGER NOT NULL, picked INTEGER NOT NULL DEFAULT 0, FOREIGN KEY(order_id) REFERENCES shop_orders(id))')
+        db.commit()
     backup_db('latest')
     print('RackFlow persistent SQLite verified:',DB,'volume identity',EXPECTED_ID[:8],flush=True)
 
@@ -234,11 +240,12 @@ def make_state(query=None):
         rack_rows=db.execute('SELECT rack,capacity FROM racks ORDER BY rack COLLATE NOCASE').fetchall()
         all_stock=db.execute('SELECT rack,model,qty FROM stock ORDER BY model COLLATE NOCASE').fetchall()
         moves=db.execute('SELECT * FROM movements ORDER BY id DESC LIMIT 100').fetchall()
+        varieties={(v['rack'],v['model']):v['variety'] for v in db.execute('SELECT rack,model,variety FROM varieties')}
     by_rack={r['rack']:{'rack':r['rack'],'capacity':r['capacity'],'used':0,'models':[]} for r in rack_rows}
     for a in all_stock:
         if a['rack'] in by_rack:
             by_rack[a['rack']]['used']+=a['qty']
-            by_rack[a['rack']]['models'].append({'model':a['model'],'qty':a['qty']})
+            by_rack[a['rack']]['models'].append({'model':a['model'],'qty':a['qty'],'variety':varieties.get((a['rack'],a['model']),'')})
     racks=list(by_rack.values())
     for r in racks:
         r['available']=max(0,r['capacity']-r['used'])
@@ -268,23 +275,24 @@ def mutate(data, direction):
 
 def make_excel(template=False):
     wb=Workbook();ws=wb.active;ws.title='Stock Master'
-    ws.append(['Rack Number','Model','Quantity','Capacity'])
+    ws.append(['Rack Number','Model','Quantity','Capacity','Variety'])
     if template:
-        for row in [('A-001','iPhone 13 D-15',15,20),('A-002','iPhone 14 CBK-1',0,20),('B-001','Samsung A55 C-1',10,20)]:ws.append(row)
+        for row in [('A-001','iPhone 13 D-15',15,20,'D-15'),('A-002','iPhone 14 CBK-1',0,20,'CBK-1'),('B-001','Samsung A55 C-1',10,20,'C-1')]:ws.append(row)
     else:
         state=make_state()
         for rack in state['racks']:
             if rack['models']:
-                for s in rack['models']:ws.append([rack['rack'],s['model'],s['qty'],rack['capacity']])
-            else:ws.append([rack['rack'],'',0,rack['capacity']])
+                for s in rack['models']:ws.append([rack['rack'],s['model'],s['qty'],rack['capacity'],s.get('variety','')])
+            else:ws.append([rack['rack'],'',0,rack['capacity'],''])
     ws.freeze_panes='A2';ws.auto_filter.ref=ws.dimensions
     for cell in ws[1]:cell.font=Font(color='FFFFFF',bold=True);cell.fill=PatternFill('solid',fgColor='17364B');cell.alignment=Alignment(horizontal='center')
-    for col,width in enumerate([22,43,18,18],1):ws.column_dimensions[get_column_letter(col)].width=width
+    for col,width in enumerate([22,43,18,18,22],1):ws.column_dimensions[get_column_letter(col)].width=width
     info=wb.create_sheet('Instructions')
     for x in [
         ['RACK STOCK MASTER — INSTRUCTIONS'],
         ['1. Each row assigns one phone-cover model to a rack.'],
-        ['2. Edit Rack Number, Model, Quantity, Capacity and upload the .xlsx in the app.'],
+        ['2. Edit Rack Number, Model, Quantity, Capacity and Variety in the .xlsx file.'],
+        ['2a. Variety is used for the Shop Orders variety-to-model dropdown.'],
         ['3. Repeat rack numbers for multiple models in one rack (capacity must be identical).'],
         ['4. To reserve an empty rack, enter rack number, blank model, quantity 0 and capacity.'],
         ['5. Upload REPLACES current stock numbers; download latest first to keep employee changes.'],
@@ -306,13 +314,13 @@ def import_excel(raw):
         for v in options:
             if v in headers:return headers.index(v)
         return None
-    rix=index(('racknumber','rack','rackid','location'));mix=index(('model','modelname','product','item'));qix=index(('quantity','qty','stock','stockquantity'));cix=index(('capacity','rackcapacity','maxqty'))
+    rix=index(('racknumber','rack','rackid','location'));mix=index(('model','modelname','product','item'));qix=index(('quantity','qty','stock','stockquantity'));cix=index(('capacity','rackcapacity','maxqty'));vix=index(('variety','varietyname','covertype','type','producttype'))
     if None in (rix,mix,qix): raise ValueError('Need columns Rack Number, Model, Quantity. Capacity is optional.')
     racks={};records={};issues=[]
     for i,row in enumerate(rows,2):
         if not any(v is not None and str(v).strip() for v in row):continue
         def at(j):return row[j] if j is not None and j<len(row) else None
-        rack=cleanstr(at(rix)).upper();model=cleanstr(at(mix))
+        rack=cleanstr(at(rix)).upper();model=cleanstr(at(mix));variety=cleanstr(at(vix))
         if not rack:issues.append(f'Row {i}: rack is blank');continue
         try:
             rawqty=at(qix); qty=int(rawqty if rawqty is not None and str(rawqty).strip() else 0)
@@ -323,7 +331,8 @@ def import_excel(raw):
         racks[rack]=cap
         if qty and not model:issues.append(f'Row {i}: model missing for positive quantity')
         if model:
-            key=(rack,model.lower()); rec=records.setdefault(key,{'rack':rack,'model':model,'qty':0});rec['qty']+=qty
+            key=(rack,model.lower()); rec=records.setdefault(key,{'rack':rack,'model':model,'qty':0,'variety':variety});rec['qty']+=qty
+            if rec['variety']!=variety:issues.append(f'Row {i}: conflicting variety for {rack}/{model}')
     usage={r:0 for r in racks}
     for rec in records.values():usage[rec['rack']]+=rec['qty']
     for r,used in usage.items():
@@ -333,13 +342,74 @@ def import_excel(raw):
     with LOCK,connect() as db:
         # Take a dated, restorable snapshot BEFORE any destructive Excel replacement.
         backup_db('pre-import')
-        db.execute('BEGIN IMMEDIATE');db.execute('DELETE FROM stock');db.execute('DELETE FROM racks')
+        db.execute('BEGIN IMMEDIATE');db.execute('DELETE FROM stock');db.execute('DELETE FROM racks');db.execute('DELETE FROM varieties')
         db.executemany('INSERT INTO racks(rack,capacity) VALUES(?,?)',racks.items())
         db.executemany('INSERT INTO stock(rack,model,qty) VALUES(?,?,?)',[(r['rack'],r['model'],r['qty']) for r in records.values()])
+        db.executemany('INSERT INTO varieties(rack,model,variety) VALUES(?,?,?)',[(r['rack'],r['model'],r['variety']) for r in records.values()])
         db.execute('INSERT INTO movements(at,employee,action,rack,model,qty,before_qty,after_qty,note) VALUES(?,?,?,?,?,?,?,?,?)',(stamp(),'Admin','EXCEL IMPORT','ALL','Master stock replaced',sum(usage.values()),None,None,f'{len(racks)} racks; {len(records)} model-rack records'))
         db.commit()
         backup_after_change()
     return {'ok':True,'racks':len(racks),'items':len(records),'units':sum(usage.values())}
+
+def shop_catalog():
+    with connect() as db:
+        rows=db.execute("SELECT s.rack,s.model,s.qty,COALESCE(v.variety,'') AS variety FROM stock s LEFT JOIN varieties v ON v.rack=s.rack AND v.model=s.model WHERE s.model<>'' ORDER BY v.variety,s.model,s.rack").fetchall()
+        return [dict(r) for r in rows]
+
+def list_shop_orders():
+    with connect() as db:
+        orders=[dict(r) for r in db.execute('SELECT * FROM shop_orders ORDER BY id DESC LIMIT 150')]
+        for o in orders:
+            o['items']=[dict(r) for r in db.execute('SELECT id,variety,model,rack,qty,picked FROM shop_order_items WHERE order_id=? ORDER BY rack,model',(o['id'],))]
+    return orders
+
+def create_shop_order(data,username):
+    shop=cleanstr(data.get('shop'))
+    lines=data.get('items')
+    if not shop or len(shop)>100:raise ValueError('Enter a valid shop name')
+    if not isinstance(lines,list) or not 1<=len(lines)<=150:raise ValueError('Add 1 to 150 order items')
+    prepared=[]
+    with LOCK,connect() as db:
+        db.execute('BEGIN IMMEDIATE')
+        for line in lines:
+            if not isinstance(line,dict):raise ValueError('Invalid order line')
+            variety=cleanstr(line.get('variety'));model=cleanstr(line.get('model'))
+            qty=positive(line.get('qty'))
+            if qty>100000:raise ValueError('Order quantity too large')
+            if not variety or not model:raise ValueError('Select variety and model')
+            matches=db.execute('SELECT s.rack,s.qty FROM stock s INNER JOIN varieties v ON v.rack=s.rack AND v.model=s.model WHERE v.variety=? AND s.model=? AND s.qty>0 ORDER BY s.qty DESC,s.rack',(variety,model)).fetchall()
+            if not matches:raise ValueError(f'No available rack for {variety} / {model}')
+            remaining=qty
+            for r in matches:
+                if remaining<=0:break
+                # Reserve nothing until picking; assignment uses current stock.
+                amount=min(remaining,r['qty'])
+                prepared.append((variety,model,r['rack'],amount))
+                remaining-=amount
+            if remaining:raise ValueError(f'Only {qty-remaining} pieces available for {variety} / {model}')
+        cur=db.execute('INSERT INTO shop_orders(shop,created_by,created_at) VALUES(?,?,?)',(shop,username,stamp()))
+        db.executemany('INSERT INTO shop_order_items(order_id,variety,model,rack,qty,picked) VALUES(?,?,?,?,?,0)',[(cur.lastrowid,*r) for r in prepared])
+        db.commit()
+    backup_after_change()
+    return {'ok':True,'order_id':cur.lastrowid}
+
+def pick_shop_item(data,username):
+    item_id=positive(data.get('item_id'),'Item ID');qty=positive(data.get('qty'),'Take Out quantity')
+    with LOCK,connect() as db:
+        db.execute('BEGIN IMMEDIATE')
+        item=db.execute('SELECT * FROM shop_order_items WHERE id=?',(item_id,)).fetchone()
+        if item is None:raise ValueError('Order item not found')
+        if qty>item['qty']-item['picked']:raise ValueError('Quantity exceeds remaining order quantity')
+        stock=db.execute('SELECT qty FROM stock WHERE rack=? AND model=?',(item['rack'],item['model'])).fetchone()
+        if not stock or stock['qty']<qty:raise ValueError('Not enough stock in assigned rack. Check physical stock and update inventory.')
+        before=stock['qty'];after=before-qty
+        db.execute('UPDATE stock SET qty=? WHERE rack=? AND model=?',(after,item['rack'],item['model']))
+        db.execute('UPDATE shop_order_items SET picked=picked+? WHERE id=?',(qty,item_id))
+        order=db.execute('SELECT shop FROM shop_orders WHERE id=?',(item['order_id'],)).fetchone()
+        db.execute('INSERT INTO movements(at,employee,action,rack,model,qty,before_qty,after_qty,note) VALUES(?,?,?,?,?,?,?,?,?)',(stamp(),username,'OUT',item['rack'],item['model'],qty,before,after,f'Shop Order #{item["order_id"]} — {order["shop"]}'))
+        db.commit()
+    backup_after_change()
+    return {'ok':True,'remaining':item['qty']-item['picked']-qty,'stock_after':after}
 
 class Handler(BaseHTTPRequestHandler):
     def log_message(self,fmt,*args): print('%s %s'%(self.address_string(),fmt%args))
@@ -359,6 +429,8 @@ class Handler(BaseHTTPRequestHandler):
             s=make_state()
             if identity['role']!='admin':s.pop('movements',None)
             respond_json(self,s);return
+        if path=='/api/shop-catalog':respond_json(self,shop_catalog());return
+        if path=='/api/shop-orders':respond_json(self,list_shop_orders());return
         if path=='/api/users':
             if identity['role']!='admin':return error(self,'Admin only',403)
             respond_json(self,admin_users());return
@@ -424,6 +496,8 @@ class Handler(BaseHTTPRequestHandler):
             if path=='/api/user-status':
                 if identity['role']!='admin':return error(self,'Admin only',403)
                 respond_json(self,set_user_active(data));return
+            if path=='/api/shop-orders':respond_json(self,create_shop_order(data,identity['username']));return
+            if path=='/api/shop-pick':respond_json(self,pick_shop_item(data,identity['username']));return
             if path=='/api/out':
                 data['employee']=identity['username']
                 respond_json(self,mutate(data,-1));return
