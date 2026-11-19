@@ -23,6 +23,8 @@
 .search-result-qty.out-of-stock{color:#ad3e4a}
 .search-result .btn{font-size:13px;white-space:nowrap;padding:11px 12px}
 @media(max-width:390px){.search-result{grid-template-columns:minmax(0,1fr) 94px;gap:6px;padding:10px}.search-result .btn{font-size:12px;padding:11px 7px}}
+/* Shop model searchable dropdown; only saved options can be selected. */
+.shop-combobox{position:relative}.shop-combobox input{padding-right:48px}.shop-combobox .shop-arrow{position:absolute;right:4px;top:4px;width:42px;height:calc(100% - 8px);border:0;background:transparent;color:#164163;font-size:18px}.shop-options{position:absolute;z-index:100;left:0;right:0;top:calc(100% + 4px);max-height:240px;overflow-y:auto;background:white;border:1px solid #bfcfdd;border-radius:11px;box-shadow:0 8px 24px #142e4825}.shop-option{width:100%;padding:12px 14px;text-align:left;border:0;border-bottom:1px solid #eef2f6;background:white;font-size:16px;color:#14263e}.shop-option:hover,.shop-option:focus{background:#e8f3ff}.shop-no-option{padding:12px;color:#64768c}
 </style></head><body><header><div class="brand">Rack<span>Flow</span></div><div class="buttons"><button class="toplink hidden" id="shopToggle">Shop Orders</button><button class="toplink hidden" id="adminToggle">Admin / Excel</button><button class="toplink hidden" id="logoutBtn">Log out</button></div></header><main>
 <section id="loginSection" class="card"><h1 class="title">Employee login</h1><p class="sub">Enter the username and password given by the warehouse owner.</p><div class="label">Username</div><input id="loginUser" autocomplete="username" placeholder="employee01 or admin"><div class="label">Password</div><input id="loginPass" type="password" autocomplete="current-password"><button class="btn" id="loginBtn" style="margin-top:14px;width:100%">Log in</button><div id="loginMsg" class="hint" style="margin-top:8px"></div></section>
 <section id="worker" class="hidden"><h1 class="title">Scan a rack</h1><p class="sub">Scan the QR sticker, then choose whether stock is coming IN or going OUT.</p>
@@ -47,7 +49,7 @@
 <div class="buttons"><button id="shopPlaceTab" class="btn">Place Order</button><button id="shopPickTab" class="btn secondary">Warehouse Orders</button></div>
 <div id="shopPlacePanel"><div class="label">Shop name</div><input id="shopName" placeholder="Enter shop name" maxlength="100">
 <div class="label">1. Variety</div><select id="shopVariety"></select>
-<div class="label">2. Model</div><select id="shopModel"></select>
+<div class="label">2. Model</div><div class="shop-combobox" id="shopModelCombo"><input id="shopModelSearch" type="search" autocomplete="off" spellcheck="false" placeholder="Type to search model" role="combobox" aria-controls="shopModelOptions" aria-expanded="false" aria-autocomplete="list" aria-label="Search and select model"><button id="shopModelArrow" class="shop-arrow" type="button" aria-label="Show models">▾</button><div id="shopModelOptions" class="shop-options hidden" role="listbox"></div></div><select id="shopModel" class="hidden" aria-hidden="true" tabindex="-1"></select>
 <div id="shopStockHint" class="hint" style="margin-top:8px"></div>
 <div class="label">3. Quantity</div><input id="shopQty" type="number" inputmode="numeric" min="1" step="1" placeholder="How many pieces?">
 <button id="shopAdd" class="btn secondary" style="width:100%;margin-top:12px">+ Add Item to Order</button>
@@ -221,8 +223,38 @@ function shopModels(){
  const models=[...new Set(shopCatalog.filter(x=>x.variety===v).map(x=>x.model))].sort((a,b)=>a.localeCompare(b));
  $('shopModel').innerHTML='<option value="">Select model</option>'+models.map(x=>`<option value="${safe(x)}">${safe(x)}</option>`).join('');
  if(models.includes(current))$('shopModel').value=current;
+ // Keep the input readout in sync with the authorized selection.
+ $('shopModelSearch').value=$('shopModel').value||'';
+ shopModelClose();
  shopHint();
 }
+function shopModelAllowed(){return [...$('shopModel').options].map(o=>o.value).filter(Boolean);}
+function shopModelClose(){$('shopModelOptions').classList.add('hidden');$('shopModelSearch').setAttribute('aria-expanded','false');}
+function shopModelSuggest(){
+ const options=shopModelAllowed(),query=$('shopModelSearch').value.trim().toLocaleLowerCase();
+ const hits=options.filter(m=>m.toLocaleLowerCase().includes(query)).slice(0,80);
+ $('shopModelOptions').innerHTML=hits.map((m,i)=>`<button type="button" class="shop-option" role="option" data-idx="${i}">${safe(m)}</button>`).join('')||'<div class="shop-no-option">No matching model in selected variety</div>';
+ $('shopModelOptions').classList.remove('hidden');$('shopModelSearch').setAttribute('aria-expanded','true');
+ $('shopModelOptions').querySelectorAll('[data-idx]').forEach(b=>b.addEventListener('pointerdown',e=>{
+  e.preventDefault();let chosen=hits[Number(b.dataset.idx)];
+  $('shopModel').value=chosen;$('shopModelSearch').value=chosen;shopModelClose();shopHint();
+ }));
+}
+$('shopModelSearch').addEventListener('input',()=>{
+ // Typing filters suggestions but is never itself a selected model.
+ $('shopModel').value='';shopHint();shopModelSuggest();
+});
+$('shopModelSearch').addEventListener('focus',shopModelSuggest);
+$('shopModelArrow').addEventListener('click',()=>{$('shopModelSearch').focus();shopModelSuggest();});
+$('shopModelSearch').addEventListener('keydown',e=>{
+ if(e.key==='Escape'){shopModelClose();$('shopModelSearch').value=$('shopModel').value||'';}
+ if(e.key==='Enter'){
+  e.preventDefault();let b=$('shopModelOptions').querySelector('[data-idx]');if(b)b.dispatchEvent(new PointerEvent('pointerdown',{bubbles:true}));
+ }
+});
+$('shopModelSearch').addEventListener('blur',()=>setTimeout(()=>{
+ shopModelClose();$('shopModelSearch').value=$('shopModel').value||'';
+},160));
 function shopHint(){const v=$('shopVariety').value,m=$('shopModel').value;
  const rows=shopCatalog.filter(x=>x.variety===v&&x.model===m);
  $('shopStockHint').textContent=rows.length?`Available ${rows.reduce((a,x)=>a+x.qty,0)} pcs · Rack(s): ${rows.map(x=>x.rack).join(', ')}`:'Select variety and model';}
@@ -253,7 +285,7 @@ $('shopPlaceTab').onclick=()=>{shopMode='place';$('shopPlacePanel').classList.re
 $('shopPickTab').onclick=()=>{shopMode='pick';$('shopPlacePanel').classList.add('hidden');$('shopPickPanel').classList.remove('hidden');shopLoad().catch(e=>shopMessage(e.message,true))};
 $('shopAdd').onclick=()=>{
  const variety=$('shopVariety').value,model=$('shopModel').value,qty=Number($('shopQty').value);
- if(!variety||!model||!Number.isInteger(qty)||qty<1)return shopMessage('Choose variety, model and positive quantity.',true);
+ if(!variety||!model||!shopModelAllowed().includes(model)||!Number.isInteger(qty)||qty<1)return shopMessage('Select a model from the dropdown and enter a positive quantity.',true);
  const available=shopCatalog.filter(x=>x.variety===variety&&x.model===model).reduce((a,x)=>a+x.qty,0);
  const old=shopCart.find(x=>x.variety===variety&&x.model===model),total=qty+(old?.qty||0);
  if(total>available)return shopMessage(`Only ${available} pieces available for this variety/model`,true);
