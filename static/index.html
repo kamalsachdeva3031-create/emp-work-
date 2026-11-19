@@ -18,6 +18,8 @@
 .search-result{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:10px;align-items:center;background:#f7faff;border:1px solid #dfebf5;border-radius:12px;padding:12px;margin:8px 0}
 .search-result-main{min-width:0;overflow-wrap:anywhere}
 .search-result-model{display:block;font-size:16px;font-weight:800;color:#14263e}
+.search-result-variety{display:block;margin-top:5px;font-size:14px;color:#41556c;font-weight:650}
+.search-result-variety.unset{font-weight:500;color:#78879a}
 .search-result-rack{display:block;margin-top:4px;font-size:14px;color:#265c88;font-weight:750}
 .search-result-qty{display:block;margin-top:4px;font-size:13px;color:#50647b}
 .search-result-qty.out-of-stock{color:#ad3e4a}
@@ -32,7 +34,7 @@
 <div class="card hidden" id="searchPanel">
   <div class="step">FIND MODEL LOCATION</div>
   <h2 class="title" style="font-size:23px;margin-top:5px">Search Model</h2>
-  <p class="sub">Type any phone model to see which rack it is in and the quantity available. You can search part of a name, such as “A15” or “iPhone 13”.</p>
+  <p class="sub">Type any phone model to see its variety, rack and quantity available. You can search part of a name, such as “A15” or “iPhone 13”.</p>
   <label for="modelSearchInput" class="label" style="display:block">Phone model</label>
   <input id="modelSearchInput" type="search" autocomplete="off" placeholder="Search e.g. Oppo A15" aria-label="Search phone model">
   <div id="modelSearchCount" class="hint" role="status" aria-live="polite" style="margin-top:12px"></div>
@@ -74,7 +76,7 @@ function renderModelSearch(){
   const matches=[];
   for(const r of (state.racks||[])){
     for(const m of (r.models||[])){
-      if(normalizeModelSearch(m.model).includes(query))matches.push({rack:r.rack,model:m.model,qty:Number(m.qty)||0});
+      if(normalizeModelSearch(m.model).includes(query))matches.push({rack:r.rack,model:m.model,variety:String(m.variety??'').trim(),qty:Number(m.qty)||0});
     }
   }
   matches.sort((a,b)=>(b.qty>0)-(a.qty>0) || a.model.localeCompare(b.model,undefined,{numeric:true}) || a.rack.localeCompare(b.rack,undefined,{numeric:true}));
@@ -84,6 +86,7 @@ function renderModelSearch(){
   results.innerHTML=displayed.map(m=>`<div class="search-result">
     <div class="search-result-main">
       <span class="search-result-model">${safe(m.model)}</span>
+      <span class="search-result-variety${m.variety?'':' unset'}">Variety: ${m.variety?safe(m.variety):'Not set in Excel'}</span>
       <span class="search-result-rack">Rack: ${safe(m.rack)}</span>
       <span class="search-result-qty${m.qty<=0?' out-of-stock':''}">${m.qty>0?`${m.qty} pcs available`:'Out of stock (0 pcs)'}</span>
     </div>
