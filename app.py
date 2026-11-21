@@ -138,6 +138,10 @@ def setup():
         db.execute("CREATE TABLE IF NOT EXISTS varieties (rack TEXT NOT NULL, model TEXT NOT NULL, variety TEXT NOT NULL DEFAULT '', PRIMARY KEY(rack,model))")
         db.execute('CREATE TABLE IF NOT EXISTS shop_orders (id INTEGER PRIMARY KEY AUTOINCREMENT, shop TEXT NOT NULL, created_by TEXT NOT NULL, created_at TEXT NOT NULL)')
         db.execute('CREATE TABLE IF NOT EXISTS shop_order_items (id INTEGER PRIMARY KEY AUTOINCREMENT, order_id INTEGER NOT NULL, variety TEXT NOT NULL, model TEXT NOT NULL, rack TEXT NOT NULL, qty INTEGER NOT NULL, picked INTEGER NOT NULL DEFAULT 0, FOREIGN KEY(order_id) REFERENCES shop_orders(id))')
+        # Additive order-cancellation fields; retain old orders and all inventory.
+        order_columns={r[1] for r in db.execute('PRAGMA table_info(shop_orders)')}
+        for column,definition in [('status',"TEXT NOT NULL DEFAULT 'active'"),('cancelled_by','TEXT'),('cancelled_at','TEXT')]:
+            if column not in order_columns:db.execute(f'ALTER TABLE shop_orders ADD COLUMN {column} {definition}')
         db.commit()
     backup_db('latest')
     print('RackFlow persistent SQLite verified:',DB,'volume identity',EXPECTED_ID[:8],flush=True)
@@ -393,12 +397,29 @@ def create_shop_order(data,username):
     backup_after_change()
     return {'ok':True,'order_id':cur.lastrowid}
 
+def cancel_shop_order(data,username):
+    order_id=positive(data.get('order_id'),'Order ID')
+    with LOCK,connect() as db:
+        db.execute('BEGIN IMMEDIATE')
+        order=db.execute('SELECT id,status FROM shop_orders WHERE id=?',(order_id,)).fetchone()
+        if not order:raise ValueError('Order not found')
+        if order['status']=='cancelled':raise ValueError('Order is already cancelled')
+        picked=db.execute('SELECT COALESCE(SUM(picked),0) FROM shop_order_items WHERE order_id=?',(order_id,)).fetchone()[0]
+        if picked:raise ValueError('Picking has already started. This order cannot be cancelled. Return items through the regular stock IN process, with a separate record.')
+        db.execute("UPDATE shop_orders SET status='cancelled',cancelled_by=?,cancelled_at=? WHERE id=? AND status='active'",(username,stamp(),order_id))
+        db.commit()
+    # No stock adjustment: orders reserve nothing and stock is deducted only during Take Out.
+    backup_after_change()
+    return {'ok':True,'order_id':order_id,'status':'cancelled'}
+
 def pick_shop_item(data,username):
     item_id=positive(data.get('item_id'),'Item ID');qty=positive(data.get('qty'),'Take Out quantity')
     with LOCK,connect() as db:
         db.execute('BEGIN IMMEDIATE')
         item=db.execute('SELECT * FROM shop_order_items WHERE id=?',(item_id,)).fetchone()
         if item is None:raise ValueError('Order item not found')
+        order_status=db.execute('SELECT status FROM shop_orders WHERE id=?',(item['order_id'],)).fetchone()
+        if not order_status or order_status['status']!='active':raise ValueError('Cancelled orders cannot be picked')
         if qty>item['qty']-item['picked']:raise ValueError('Quantity exceeds remaining order quantity')
         stock=db.execute('SELECT qty FROM stock WHERE rack=? AND model=?',(item['rack'],item['model'])).fetchone()
         if not stock or stock['qty']<qty:raise ValueError('Not enough stock in assigned rack. Check physical stock and update inventory.')
@@ -498,6 +519,7 @@ class Handler(BaseHTTPRequestHandler):
                 respond_json(self,set_user_active(data));return
             if path=='/api/shop-orders':respond_json(self,create_shop_order(data,identity['username']));return
             if path=='/api/shop-pick':respond_json(self,pick_shop_item(data,identity['username']));return
+            if path=='/api/shop-cancel':respond_json(self,cancel_shop_order(data,identity['username']));return
             if path=='/api/out':
                 data['employee']=identity['username']
                 respond_json(self,mutate(data,-1));return
