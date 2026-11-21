@@ -342,7 +342,8 @@ function shopRenderOrders(){
  const done=!cancelled&&o.items.every(x=>x.picked===x.qty);
  const status=cancelled?'Cancelled':done?'Completed':picked?'Picking in progress':'Pending';
  const audit=cancelled?`<div class="hint">Cancelled by ${safe(o.cancelled_by||'Unknown')} · ${safe(o.cancelled_at||'')}</div>`:'';
- const cancelButton=!cancelled&&!done&&picked===0?`<button class="btn red" style="margin-top:12px;width:100%" data-cancel-order="${o.id}">Cancel Order</button>`:'';
+ const canCancel=identity?.role==='admin'||o.created_by===identity?.username;
+ const cancelButton=canCancel&&!cancelled&&!done&&picked===0?`<button class="btn red" style="margin-top:12px;width:100%" data-cancel-order="${o.id}">Cancel Order</button>`:'';
  return `<div class="card" style="margin:12px 0"><strong>Order #${o.id} — ${safe(o.shop)}</strong><div class="hint">By ${safe(o.created_by)} · ${safe(o.created_at)} · <strong>${status}</strong></div>${audit}`+
  o.items.map(x=>`<div class="model-out-row" style="margin-top:10px"><div class="model-out-info"><span class="model-out-name">${safe(x.variety)} / ${safe(x.model)}</span><span class="model-out-stock">Rack ${safe(x.rack)} · ${x.picked}/${x.qty} picked</span></div><input class="model-out-qty" type="number" min="1" max="${x.qty-x.picked}" value="${Math.max(1,x.qty-x.picked)}" data-qty="${x.id}" ${cancelled||x.picked===x.qty?'disabled':''}><button class="btn row-take-btn ${done?'secondary':''}" data-pick="${x.id}" ${cancelled||x.picked===x.qty?'disabled':''}>${cancelled?'Cancelled':x.picked===x.qty?'Done':'Take Out'}</button></div>`).join('')+cancelButton+'</div>';
  }).join('')||'<div class="hint">No shop orders yet.</div>';
