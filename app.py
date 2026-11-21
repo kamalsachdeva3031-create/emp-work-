@@ -397,12 +397,13 @@ def create_shop_order(data,username):
     backup_after_change()
     return {'ok':True,'order_id':cur.lastrowid}
 
-def cancel_shop_order(data,username):
+def cancel_shop_order(data,username,role):
     order_id=positive(data.get('order_id'),'Order ID')
     with LOCK,connect() as db:
         db.execute('BEGIN IMMEDIATE')
-        order=db.execute('SELECT id,status FROM shop_orders WHERE id=?',(order_id,)).fetchone()
+        order=db.execute('SELECT id,status,created_by FROM shop_orders WHERE id=?',(order_id,)).fetchone()
         if not order:raise ValueError('Order not found')
+        if role!='admin' and order['created_by']!=username:raise PermissionError('You can cancel only orders you placed')
         if order['status']=='cancelled':raise ValueError('Order is already cancelled')
         picked=db.execute('SELECT COALESCE(SUM(picked),0) FROM shop_order_items WHERE order_id=?',(order_id,)).fetchone()[0]
         if picked:raise ValueError('Picking has already started. This order cannot be cancelled. Return items through the regular stock IN process, with a separate record.')
@@ -519,7 +520,10 @@ class Handler(BaseHTTPRequestHandler):
                 respond_json(self,set_user_active(data));return
             if path=='/api/shop-orders':respond_json(self,create_shop_order(data,identity['username']));return
             if path=='/api/shop-pick':respond_json(self,pick_shop_item(data,identity['username']));return
-            if path=='/api/shop-cancel':respond_json(self,cancel_shop_order(data,identity['username']));return
+            if path=='/api/shop-cancel':
+                try:respond_json(self,cancel_shop_order(data,identity['username'],identity['role']))
+                except PermissionError as ex:return error(self,str(ex),403)
+                return
             if path=='/api/out':
                 data['employee']=identity['username']
                 respond_json(self,mutate(data,-1));return
