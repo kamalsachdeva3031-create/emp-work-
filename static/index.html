@@ -337,10 +337,22 @@ function shopRenderCart(){
 }
 function shopRenderOrders(){
  $('shopOrderList').innerHTML=shopOrdersData.map(o=>{
- const done=o.items.every(x=>x.picked===x.qty);
- return `<div class="card" style="margin:12px 0"><strong>Order #${o.id} — ${safe(o.shop)}</strong><div class="hint">By ${safe(o.created_by)} · ${safe(o.created_at)} · ${done?'Completed':'Pending'}</div>`+
- o.items.map(x=>`<div class="model-out-row" style="margin-top:10px"><div class="model-out-info"><span class="model-out-name">${safe(x.variety)} / ${safe(x.model)}</span><span class="model-out-stock">Rack ${safe(x.rack)} · ${x.picked}/${x.qty} picked</span></div><input class="model-out-qty" type="number" min="1" max="${x.qty-x.picked}" value="${Math.max(1,x.qty-x.picked)}" data-qty="${x.id}" ${x.picked===x.qty?'disabled':''}><button class="btn row-take-btn ${done?'secondary':''}" data-pick="${x.id}" ${x.picked===x.qty?'disabled':''}>${x.picked===x.qty?'Done':'Take Out'}</button></div>`).join('')+'</div>';
+ const cancelled=o.status==='cancelled';
+ const picked=o.items.reduce((n,x)=>n+x.picked,0);
+ const done=!cancelled&&o.items.every(x=>x.picked===x.qty);
+ const status=cancelled?'Cancelled':done?'Completed':picked?'Picking in progress':'Pending';
+ const audit=cancelled?`<div class="hint">Cancelled by ${safe(o.cancelled_by||'Unknown')} · ${safe(o.cancelled_at||'')}</div>`:'';
+ const cancelButton=!cancelled&&!done&&picked===0?`<button class="btn red" style="margin-top:12px;width:100%" data-cancel-order="${o.id}">Cancel Order</button>`:'';
+ return `<div class="card" style="margin:12px 0"><strong>Order #${o.id} — ${safe(o.shop)}</strong><div class="hint">By ${safe(o.created_by)} · ${safe(o.created_at)} · <strong>${status}</strong></div>${audit}`+
+ o.items.map(x=>`<div class="model-out-row" style="margin-top:10px"><div class="model-out-info"><span class="model-out-name">${safe(x.variety)} / ${safe(x.model)}</span><span class="model-out-stock">Rack ${safe(x.rack)} · ${x.picked}/${x.qty} picked</span></div><input class="model-out-qty" type="number" min="1" max="${x.qty-x.picked}" value="${Math.max(1,x.qty-x.picked)}" data-qty="${x.id}" ${cancelled||x.picked===x.qty?'disabled':''}><button class="btn row-take-btn ${done?'secondary':''}" data-pick="${x.id}" ${cancelled||x.picked===x.qty?'disabled':''}>${cancelled?'Cancelled':x.picked===x.qty?'Done':'Take Out'}</button></div>`).join('')+cancelButton+'</div>';
  }).join('')||'<div class="hint">No shop orders yet.</div>';
+ $('shopOrderList').querySelectorAll('[data-cancel-order]').forEach(b=>b.onclick=async()=>{
+  const id=Number(b.dataset.cancelOrder);
+  if(!confirm(`Cancel Order #${id}? This action cannot be undone. No stock will be changed.`))return;
+  b.disabled=true;
+  try{await api('/api/shop-cancel',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({order_id:id})});await shopLoad();shopMessage(`Order #${id} cancelled. It remains in order history.`);}
+  catch(e){shopMessage(e.message,true);b.disabled=false;}
+ });
  $('shopOrderList').querySelectorAll('[data-pick]').forEach(b=>b.onclick=async()=>{
   const id=Number(b.dataset.pick),q=Number($(`shopOrderList`).querySelector(`[data-qty="${id}"]`).value);
   if(!Number.isInteger(q)||q<1)return shopMessage('Enter a valid take out quantity',true);
