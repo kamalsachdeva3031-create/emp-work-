@@ -8,6 +8,8 @@ from openpyxl import Workbook, load_workbook
 from openpyxl.styles import Font, PatternFill, Alignment
 from openpyxl.utils import get_column_letter
 import qrcode
+import zipfile, csv
+from zoneinfo import ZoneInfo
 
 BASE=Path(__file__).resolve().parent
 IS_RAILWAY=any(os.getenv(k) for k in ('RAILWAY_ENVIRONMENT','RAILWAY_ENVIRONMENT_ID','RAILWAY_PROJECT_ID','RAILWAY_DEPLOYMENT_ID'))
@@ -81,6 +83,8 @@ def backup_db(category='latest'):
             name=f'pre-import_{now.strftime("%Y%m%d_%H%M%S_%f")}.db'
         elif category=='manual':
             name=f'manual_{now.strftime("%Y%m%d_%H%M%S_%f")}.db'
+        elif category=='export':
+            name=f'export_{now.strftime("%Y%m%d_%H%M%S_%f")}.db'
         elif category=='pre-upgrade':
             name=f'pre-upgrade_{now.strftime("%Y%m%d_%H%M%S_%f")}.db'
         else:
@@ -144,6 +148,13 @@ def setup():
             if column not in order_columns:db.execute(f'ALTER TABLE shop_orders ADD COLUMN {column} {definition}')
         db.execute('CREATE TABLE IF NOT EXISTS stock_imports (export_id TEXT PRIMARY KEY, imported_at TEXT NOT NULL)')
         db.execute('CREATE TABLE IF NOT EXISTS stock_add_uploads (file_sha256 TEXT PRIMARY KEY, uploaded_at TEXT NOT NULL, uploaded_by TEXT NOT NULL)')
+        db.execute('''CREATE TABLE IF NOT EXISTS download_events (
+            id TEXT PRIMARY KEY, at_utc TEXT NOT NULL, username TEXT NOT NULL,
+            kind TEXT NOT NULL, excel_file TEXT NOT NULL DEFAULT '', backup_file TEXT NOT NULL DEFAULT '',
+            rack_count INTEGER NOT NULL, model_count INTEGER NOT NULL, unit_count INTEGER NOT NULL,
+            excel_sha256 TEXT NOT NULL DEFAULT '', backup_sha256 TEXT NOT NULL DEFAULT ''
+        )''')
+        db.execute('CREATE INDEX IF NOT EXISTS ix_download_events_at ON download_events(at_utc DESC)')
         db.commit()
     backup_db('latest')
     print('RackFlow persistent SQLite verified:',DB,'volume identity',EXPECTED_ID[:8],flush=True)
@@ -279,7 +290,7 @@ def mutate(data, direction):
         backup_after_change()
         return {'ok':True,'rack':rack,'model':model,'before':before,'after':after}
 
-def make_excel(template=False):
+def make_excel(template=False, exported_at=None):
     # A snapshot travels with each downloaded workbook so live employee movements are
     # preserved when the admin later uploads their edited copy.
     with LOCK,connect() as db:
@@ -308,7 +319,7 @@ def make_excel(template=False):
         ['2a. Variety is used for the Shop Orders variety-to-model dropdown.'],
         ['3. Repeat rack numbers for multiple models in one rack (capacity must be identical).'],
         ['4. To reserve an empty rack, enter rack number, blank model, quantity 0 and capacity.'],
-        ['5. Upload REPLACES current stock numbers; download latest first to keep employee changes.'],
+        ['5. Stock updates are merged with employee movements. Rows or racks missing from Excel are BLOCKED.'],
         ['6. Employee IN and OUT changes are logged separately.'],
         ['7. Racks must have stock <= capacity; quantities cannot be negative.'],
     ]: info.append(x)
@@ -317,12 +328,130 @@ def make_excel(template=False):
     info['A11']='Live employee IN/OUT changes after download are automatically retained when you import the edited Excel.'
     info['A12']='To set an absolute final count, download a fresh stock file and edit it again.'
     info['A13']='An edited workbook can only be imported once. Download a fresh copy for the next update.'
+    if exported_at:info['A14']=f'Exported at: {exported_at}. Matching database backup saved in Admin > Download History.'
+    info['A15']='SAFETY: Never delete whole rack/model rows. Set stock to 0 and leave the row in place, or use Add Rack & Stock.'
     snapshot=wb.create_sheet('_RackFlow_Snapshot')
-    snapshot.append(['RACKFLOW_SAFE_IMPORT_V1',export_id,EXPECTED_ID or ''])
+    snapshot.append(['RACKFLOW_SAFE_IMPORT_V1',export_id,EXPECTED_ID or '',exported_at or ''])
     snapshot.append(['Rack Number','Model','Original Quantity'])
     for row in baseline:snapshot.append(row)
     snapshot.sheet_state='veryHidden'
     buf=BytesIO();wb.save(buf);return buf.getvalue()
+
+# Download history is kept in SQLite on the persistent volume, not in browser memory.
+# Each full-stock Excel export creates a paired, tested database backup first.
+IST=ZoneInfo('Asia/Kolkata')
+
+def ist_time(at_utc):
+    return datetime.datetime.fromisoformat(at_utc).astimezone(IST).strftime('%d %b %Y, %I:%M:%S %p IST')
+
+def inventory_counts(db):
+    return (db.execute('SELECT COUNT(*) FROM racks').fetchone()[0],
+            db.execute('SELECT COUNT(*) FROM stock').fetchone()[0],
+            db.execute('SELECT COALESCE(SUM(qty),0) FROM stock').fetchone()[0])
+
+def write_atomic(path,contents):
+    fd,tmp=tempfile.mkstemp(prefix='.rackflow_out_',suffix='.tmp',dir=BACKUPS)
+    try:
+        with os.fdopen(fd,'wb') as f:
+            f.write(contents);f.flush();os.fsync(f.fileno())
+        os.replace(tmp,path)
+    finally:
+        if os.path.exists(tmp):os.unlink(tmp)
+
+def record_download(db, event_id, at_utc, user, kind, xlsx='', backup='', counts=(0,0,0)):
+    excel_path=BACKUPS/xlsx if xlsx else None
+    backup_path=BACKUPS/backup if backup else None
+    excel_hash=hashlib.sha256(excel_path.read_bytes()).hexdigest() if excel_path else ''
+    backup_hash=hashlib.sha256(backup_path.read_bytes()).hexdigest() if backup_path else ''
+    db.execute("""INSERT INTO download_events
+        (id,at_utc,username,kind,excel_file,backup_file,rack_count,model_count,unit_count,excel_sha256,backup_sha256)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+        (event_id,at_utc,user,kind,xlsx,backup,*counts,excel_hash,backup_hash))
+    db.commit()
+
+def make_stock_download(username,kind='stock_excel'):
+    """Save Excel and matched SQLite point-in-time backup before sending either file."""
+    with LOCK:
+        at=datetime.datetime.now(datetime.timezone.utc)
+        local=at.astimezone(IST)
+        eid=uuid.uuid4().hex
+        tag=local.strftime('%Y-%m-%d_%H%M%S_IST')+'_'+eid[:8]
+        fname=f'rack_stock_{tag}.xlsx'
+        # SQL read and backup happen under the same write lock as employee IN/OUT.
+        with connect() as db:counts=inventory_counts(db)
+        backup=backup_db('export')
+        excel=make_excel(exported_at=local.strftime('%d %b %Y %I:%M:%S %p IST'))
+        write_atomic(BACKUPS/fname,excel)
+        with connect() as db:
+            record_download(db,eid,at.isoformat(),username,kind,fname,backup.name,counts)
+        return eid, fname, excel, backup
+
+def make_snapshot_zip(event,excel_bytes,backup_bytes):
+    out=BytesIO()
+    manifest={'download_id':event['id'],'generated_utc':event['at_utc'],
+              'generated_ist':ist_time(event['at_utc']),
+              'user':event['username'],'kind':event['kind'],
+              'rack_count':event['rack_count'],'model_count':event['model_count'],
+              'total_pieces':event['unit_count'],
+              'excel_filename':event['excel_file'],'database_filename':event['backup_file'],
+              'excel_sha256':event['excel_sha256'],'database_sha256':event['backup_sha256']}
+    with zipfile.ZipFile(out,'w',zipfile.ZIP_DEFLATED) as z:
+        z.writestr(event['excel_file'],excel_bytes)
+        z.writestr(event['backup_file'],backup_bytes)
+        z.writestr('SNAPSHOT_MANIFEST.json',json.dumps(manifest,indent=2))
+        z.writestr('IMPORTANT_READ_FIRST.txt',
+            'This ZIP contains a full RackFlow database backup including employee accounts and stock history.\n'
+            'KEEP PRIVATE. Save a copy outside Railway (computer or secure cloud storage).\n'
+            'DO NOT upload the .db file into Current Stock Excel. Database restore is an admin recovery operation.\n'
+            'To edit stock, extract the .xlsx file; preserve its hidden _RackFlow_Snapshot sheet.\n')
+    return out.getvalue()
+
+def list_downloads(limit=100):
+    with connect() as db:
+        history=[dict(r) for r in db.execute('SELECT * FROM download_events ORDER BY at_utc DESC LIMIT ?', (limit,))]
+    for event in history:
+        event['at_ist']=ist_time(event['at_utc'])
+        event['excel_available']=bool(event['excel_file'] and (BACKUPS/event['excel_file']).is_file())
+        event['backup_available']=bool(event['backup_file'] and (BACKUPS/event['backup_file']).is_file())
+    return history
+
+def get_download(event_id,kind):
+    if not re.fullmatch('[a-f0-9]{32}',event_id):raise ValueError('Invalid download ID')
+    if kind not in ('xlsx','db','zip'):raise ValueError('Unknown download type')
+    with connect() as db:
+        row=db.execute('SELECT * FROM download_events WHERE id=?',(event_id,)).fetchone()
+        if not row:raise ValueError('Download not found')
+        event=dict(row)
+    if kind=='zip' and not event['excel_file']:raise ValueError('No Excel file for this backup')
+    items=[]
+    for filename,checksum in ((event['excel_file'],event['excel_sha256']),
+                              (event['backup_file'],event['backup_sha256'])):
+        if not filename:
+            items.append(b'');continue
+        if Path(filename).name!=filename or '..' in filename:raise ValueError('Invalid archived file name')
+        p=BACKUPS/filename
+        if not p.is_file():raise ValueError('This archived file is no longer on the server. Use your external backup.')
+        raw=p.read_bytes()
+        if hashlib.sha256(raw).hexdigest()!=checksum:raise ValueError('Archive checksum mismatch; file download blocked')
+        items.append(raw)
+    excel,backup=items
+    if kind=='xlsx':
+        if not excel:raise ValueError('No Excel saved for this entry')
+        return excel,event['excel_file'],'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+    if kind=='db':return backup,event['backup_file'],'application/octet-stream'
+    name=f'rackflow_snapshot_{event_id[:8]}.zip'
+    return make_snapshot_zip(event,excel,backup),name,'application/zip'
+
+def download_history_csv():
+    buf=BytesIO()
+    import io
+    out=io.StringIO()
+    w=csv.writer(out)
+    w.writerow(('Time IST','Time UTC','Downloaded By','Type','Racks','Stock Rows','Pieces','Excel Filename','Database Filename','Excel SHA256','Database SHA256'))
+    with connect() as db:
+        for r in db.execute('SELECT * FROM download_events ORDER BY at_utc DESC'):
+            w.writerow((ist_time(r['at_utc']),r['at_utc'],r['username'],r['kind'],r['rack_count'],r['model_count'],r['unit_count'],r['excel_file'],r['backup_file'],r['excel_sha256'],r['backup_sha256']))
+    return out.getvalue().encode('utf-8-sig')
 
 def make_add_only_template():
     """Independent add-only workbook; never exports or snapshots existing stock."""
@@ -497,6 +626,14 @@ def import_excel(raw):
             raise ValueError('This Excel has already been uploaded. Download a fresh Current Stock Excel to make another update.')
         current={(r['rack'],r['model'].lower()):(r['model'],r['qty']) for r in db.execute('SELECT rack,model,qty FROM stock')}
         existing_varieties={(r['rack'],r['model'].lower()):r['variety'] for r in db.execute('SELECT rack,model,variety FROM varieties')}
+        live_racks={r['rack'] for r in db.execute('SELECT rack FROM racks')}
+        missing_racks=sorted(live_racks-set(racks))
+        if missing_racks:
+            raise ValueError('SAFETY STOP: existing racks missing from Excel: '+', '.join(missing_racks[:15])+'. All racks (even empty racks) must remain. Download a fresh stock Excel.')
+        missing_baseline=sorted(set(baseline)-set(records))
+        if missing_baseline:
+            preview=', '.join(f'{rr} / {mm}' for rr,mm in missing_baseline[:8])
+            raise ValueError('SAFETY STOP: rows present when you downloaded the Excel are missing now: '+preview+'. Do not delete rows; set quantity to 0. No stock changed.')
         proposed={}
         target_keys=set(records)|set(baseline)
         for key in target_keys:
@@ -613,6 +750,26 @@ def pick_shop_item(data,username):
     backup_after_change()
     return {'ok':True,'remaining':item['qty']-item['picked']-qty,'stock_after':after}
 
+def movement_excel():
+    # Export the entire existing movement log without changing stock or history.
+    with connect() as db:
+        rows=db.execute('SELECT id,at,employee,action,rack,model,qty,before_qty,after_qty,note FROM movements ORDER BY id DESC').fetchall()
+    wb=Workbook();ws=wb.active;ws.title='Movements'
+    ws.append(['Movement ID','Date / Time (IST)','Employee','Action','Rack','Model','Quantity','Stock Before','Stock After','Note'])
+    for r in rows:
+        try:
+            t=datetime.datetime.fromisoformat(r['at'].replace('Z','+00:00'))
+            at=t.astimezone(ZoneInfo('Asia/Kolkata')).replace(tzinfo=None) if t.tzinfo else r['at']
+        except (ValueError,TypeError,AttributeError):at=r['at']
+        ws.append([r['id'],at,r['employee'],r['action'],r['rack'],r['model'],r['qty'],r['before_qty'],r['after_qty'],r['note']])
+        for cell in ws[ws.max_row]:
+            if isinstance(cell.value,str):cell.data_type='s'
+        if isinstance(at,datetime.datetime):ws.cell(ws.max_row,2).number_format='dd-mmm-yyyy hh:mm:ss'
+    ws.freeze_panes='A2';ws.auto_filter.ref=ws.dimensions
+    for cell in ws[1]:cell.font=Font(color='FFFFFF',bold=True);cell.fill=PatternFill('solid',fgColor='17364B')
+    for col,width in enumerate([16,25,23,23,20,42,14,16,16,65],1):ws.column_dimensions[get_column_letter(col)].width=width
+    buf=BytesIO();wb.save(buf);return buf.getvalue()
+
 class Handler(BaseHTTPRequestHandler):
     def log_message(self,fmt,*args): print('%s %s'%(self.address_string(),fmt%args))
     def do_GET(self):
@@ -636,12 +793,36 @@ class Handler(BaseHTTPRequestHandler):
         if path=='/api/users':
             if identity['role']!='admin':return error(self,'Admin only',403)
             respond_json(self,admin_users());return
+        if path=='/api/movements.xlsx':
+            if identity['role']!='admin':return error(self,'Admin only',403)
+            tag=datetime.datetime.now(ZoneInfo('Asia/Kolkata')).strftime('%Y-%m-%d_%H%M%S')
+            self.binary(movement_excel(),'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',attachment=f'rackflow_movements_{tag}.xlsx');return
         if path=='/api/backup':
             if identity['role']!='admin':return error(self,'Admin only',403)
             with LOCK:
+                with connect() as db:counts=inventory_counts(db)
                 snapshot=backup_db('manual')
+                eid=uuid.uuid4().hex;at=datetime.datetime.now(datetime.timezone.utc).isoformat()
+                with connect() as db:record_download(db,eid,at,identity['username'],'manual_db','',snapshot.name,counts)
                 payload=snapshot.read_bytes()
-            self.binary(payload,'application/octet-stream',attachment='rackflow-full-backup.db');return
+            self.binary(payload,'application/octet-stream',attachment=snapshot.name);return
+        if path=='/api/export-history':
+            if identity['role']!='admin':return error(self,'Admin only',403)
+            respond_json(self,list_downloads());return
+        if path=='/api/export-history.csv':
+            if identity['role']!='admin':return error(self,'Admin only',403)
+            self.binary(download_history_csv(),'text/csv; charset=utf-8',attachment='rackflow_download_history.csv');return
+        if path=='/api/export-file':
+            if identity['role']!='admin':return error(self,'Admin only',403)
+            args=parse_qs(urlparse(self.path).query)
+            try:payload,filename,ctype=get_download(args.get('id',[''])[0],args.get('kind',[''])[0])
+            except ValueError as ex:return error(self,str(ex),400)
+            self.binary(payload,ctype,attachment=filename);return
+        if path=='/api/export-package':
+            if identity['role']!='admin':return error(self,'Admin only',403)
+            eid,filename,excel,backup=make_stock_download(identity['username'],'stock_bundle')
+            payload,name,ctype=get_download(eid,'zip')
+            self.binary(payload,ctype,attachment=name);return
         if path=='/api/storage-status':
             if identity['role']!='admin':return error(self,'Admin only',403)
             with connect() as db:
@@ -652,7 +833,10 @@ class Handler(BaseHTTPRequestHandler):
             self.binary(make_add_only_template(),'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',attachment='rackflow_add_rack_stock_template.xlsx');return
         if path in ('/api/export','/api/template'):
             if identity['role']!='admin':return error(self,'Admin only',403)
-            self.binary(make_excel(path.endswith('template')),'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',attachment='rack_stock_template.xlsx' if path.endswith('template') else 'rack_stock_current.xlsx');return
+            if path=='/api/template':
+                self.binary(make_excel(True),'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',attachment='rack_stock_template.xlsx');return
+            eid,filename,excel,backup=make_stock_download(identity['username'])
+            self.binary(excel,'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',attachment=filename);return
         if path.startswith('/api/qr/'):
             if identity['role']!='admin':return error(self,'Admin only',403)
             rack=path[len('/api/qr/'):].strip().upper()
